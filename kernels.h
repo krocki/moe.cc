@@ -46,5 +46,13 @@ void moe_forward_f32_mode(
     int* top_idx,          // [T*k]
     float* top_p);         // [T*k]
 
-#endif
+// RMSNorm forward
+// x: [T, d_model]
+// w: [d_model] (scale weights)
+// eps: epsilon for numerical stability
+// y: [T, d_model] output
+void rmsnorm_forward_f32(const float* x, const float* w,
+                         int T, int d_model, float eps,
+                         float* y);
 
+#endif

@@ -1,6 +1,10 @@
-# Qwen3 MoE (C) — Minimal Expert & MoE Block Tests
+# Qwen3 MoE (C) — Minimal Expert, MoE Block, and RMSNorm
 
-Everything is split into small, readable pieces (2‑space indentation). Makefile rules use tabs.
+A tiny, readable C testbed for Qwen3-30B-A3B MoE parts:
+- experts (SwiGLU MLP)
+- router (two modes)
+- MoE block (router + experts)
+- RMSNorm
 
 ### Setup
 
@@ -13,15 +17,28 @@ conda install accelerate
 ```
 
 
+
 ## Files
-- `io.h`, `io.c` — tiny `.bin` (export.py) and `.npy` readers
+
+- `io.h`, `io.c` — simple readers for:
+  - `.bin` (from `export.py`) with named tensors
+  - `.npy` (float32 C-order) for I/O goldens
 - `utils.h`, `utils.c` — helpers (`max_abs_diff`)
-- `kernels.h`, `kernels.c` — matmul, SiLU, expert forward, router, MoE forward (both routing modes)
-- `test_expert.c` — validates a single expert forward
-- `test_moe_block.c` — validates the MoE block with selectable routing mode (`konly` / `full`)
-- `export.py` — exports router + experts into a single `.bin` (accepts `--experts all` or IDs list)
-- `dump_expert_io.py` — creates `x.npy`/`y.npy` for a single expert
-- `dump_moe_io.py` — creates `x.npy`/`y.npy` for the full MoE block; emits `experts.txt` and suggested export commands
+- `kernels.h`, `kernels.c` — kernels:
+  - `matmul_f32`, `silu_f32`
+  - `expert_forward_f32` (SwiGLU: `down(silu(gate(x)) * up(x))`)
+  - Router:
+    - `ROUTER_TOPK_KONLY`: top‑k logits → softmax over **k**
+    - `ROUTER_SOFTMAX_ALL_TOPK`: softmax over **all E** → top‑k by prob
+  - `moe_forward_f32_mode(...)` — full MoE forward with a routing mode
+  - `rmsnorm_forward_f32` — RMSNorm
+- `test_expert.c` — validates a single expert
+- `test_moe_block.c` — validates MoE block with selectable routing
+- `test_rmsnorm.c` — validates RMSNorm
+- `export.py` — exports weights from HF into a `.bin` (router + selected experts or “all”)
+- `dump_expert_io.py` — creates goldens for a single expert
+- `dump_moe_io.py` — creates goldens for a full MoE block (union-of-topk experts list)
+- `dump_rmsnorm_io.py` — creates goldens for RMSNorm
 
 > **Tip:** Compile with `-DDEBUG -DBENCH` for verbose prints and timings.
 
@@ -113,6 +130,37 @@ python3 export.py --model Qwen/Qwen3-30B-A3B \
 ```bash
 ./test_moe_block l0_moe_full.bin qwen3_L0_MOE_full.x.npy qwen3_L0_MOE_full.y.npy full
 # Expect: Max abs diff ~1e-6 → PASS
+```
+
+## 3) Test **RMSNorm**
+
+1) Generate goldens (choose input or post):
+```
+python3 export.py --model Qwen/Qwen3-30B-A3B --out l0_norms.bin --layer 0 --part norms --quant none
+```
+
+Check names:
+
+```
+./list_bin l0_norms.bin | head -50
+
+model.layers.0.input_layernorm.weight
+model.layers.0.post_attention_layernorm.weight
+```
+2) Export norms for that layer:
+
+choose input/output
+```
+python3 dump_rmsnorm_io.py --model Qwen/Qwen3-30B-A3B \
+  --layer 0 --which input --eps 1e-6 --seqlen 4 --seed 123 \
+  --outbase qwen3_L0_RMS_in
+```
+
+3) Run test
+
+```
+./test_rmsnorm l0_norms.bin qwen3_L0_RMS_in.x.npy qwen3_L0_RMS_in.y.npy "model.layers.0.input_layernorm.weight" 1e-6
+# Expect ~1e-7 → PASS
 ```
 
 ---

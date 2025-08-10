@@ -1,8 +1,6 @@
-
 #!/usr/bin/env python3
-# scripts/export_weights.py (robust --experts handling)
 import argparse, struct, torch
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM
 
 MAGIC = b"QW3W\x00\x01"
 
@@ -19,50 +17,60 @@ def _save_tensor(f, name, t):
   f.write(struct.pack("<" + "I"*t.dim(), *t.shape))
   f.write(t.cpu().numpy().tobytes())
 
+def _is_norm_key(k: str) -> bool:
+  # Handle Qwen/LLaMA/etc variants
+  # e.g., input_layernorm, post_attention_layernorm, ln1/ln2, rms_1/rms_2
+  norm_markers = ["layernorm", ".ln", "rms_"]
+  return any(m in k for m in norm_markers)
+
 def iter_subset(sd, args):
   if getattr(args, "all", False):
-    for k,t in sd.items(): yield k,t; return
+    for k,t in sd.items(): yield k,t
+    return
+
   if getattr(args, "embeds", False):
     yield "model.embed_tokens.weight", sd["model.embed_tokens.weight"]
   if getattr(args, "lm_head", False) and "lm_head.weight" in sd:
     yield "lm_head.weight", sd["lm_head.weight"]
+
   if args.layer is not None:
-    L=args.layer; part=args.part
-    # normalize experts
-    experts_str = getattr(args,"experts",None)
+    L = args.layer
+    part = args.part
+    pref = f"model.layers.{L}."
+
+    # Normalize experts list
+    experts_str = getattr(args, "experts", None)
     experts_set = None
     if experts_str:
-      if experts_str=="all":
-        experts_set = None  # include all experts
+      if experts_str == "all":
+        experts_set = None
       else:
-        # allow space/comma
         if isinstance(experts_str, list):
           flat = []
           for item in experts_str:
             flat.extend(item.split(","))
           experts_str = ",".join(flat)
-        ids = [s for s in experts_str.split(",") if s.strip()!=""]
+        ids = [s for s in experts_str.split(",") if s.strip() != ""]
         experts_set = set(int(x) for x in ids)
-    pref = f"model.layers.{L}."
+
     for k,t in sd.items():
       if not k.startswith(pref): continue
-      if part=="attn" and ".self_attn." in k:
+      if part == "attn" and ".self_attn." in k:
         yield k,t
-      elif part=="norms" and ".layernorm" in k:
+      elif part == "norms" and _is_norm_key(k):
         yield k,t
-      elif part=="mlp":
+      elif part == "mlp":
         if ".experts." in k:
-          if experts_set is None:  # all
+          if experts_set is None:
             yield k,t
           else:
-            # filter by expert id
             try:
               e = int(k.split(".experts.")[1].split(".")[0])
             except Exception:
               continue
-            if e in experts_set: yield k,t
+            if e in experts_set:
+              yield k,t
         elif ".mlp.gate." in k or ".mlp.router.gate." in k:
-          # always keep router weights with mlp
           yield k,t
 
 def main():
@@ -88,6 +96,6 @@ def main():
     for name,t in selected:
       _save_tensor(f, name, t.float())
 
-if __name__=="__main__":
+if __name__ == "__main__":
   main()
 

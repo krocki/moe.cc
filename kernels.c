@@ -230,3 +230,32 @@ void moe_forward_f32_mode(
   free(logits);
 }
 
+void rmsnorm_forward_f32(const float* x, const float* w,
+                         int T, int d_model, float eps,
+                         float* y) {
+#ifdef BENCH
+  double ms = 0.0;
+#endif
+  DBG("[rmsnorm] T=%d d_model=%d eps=%g\n", T, d_model, eps);
+#ifdef BENCH
+  TIMER_DECL;
+  TIMER_START();
+#endif
+  for (int t = 0; t < T; ++t) {
+    const float* xt = x + t * d_model;
+    float* yt = y + t * d_model;
+    float msq = 0.0f;
+    for (int i = 0; i < d_model; ++i)
+      msq += xt[i] * xt[i];
+    msq /= (float)d_model;
+    float inv = 1.0f / sqrtf(msq + eps);
+    for (int i = 0; i < d_model; ++i)
+      yt[i] = xt[i] * inv * (w ? w[i] : 1.0f);
+  }
+#ifdef BENCH
+  TIMER_END_MS(ms);
+  DBG("[rmsnorm] done in %.3f ms\n", ms);
+#else
+  DBG("[rmsnorm] done\n");
+#endif
+}
