@@ -330,7 +330,7 @@ void attn_forward_f32_gqa(
     for (int t=0; t<T; ++t) {
       float* Qt = &Q[t*Dq];
       for (int h=0; h<n_q; ++h) {
-        const float* scale_vec = NULL;
+        //const float* scale_vec = NULL;
         float scale_head = 1.0f;
         // If qn is per-channel (length Dq), treat qn[h*head_dim + d]
         // else if per-head (length n_q), treat qn[h]
@@ -398,4 +398,82 @@ void attn_forward_f32_gqa(
 #ifdef BENCH
   DBG("[attn/gqa] out_proj done in %.3f ms\n", ms);
 #endif
+}
+
+// Rotate one even/odd pair in-place by angle φ using cosφ=c and sinφ=s.
+// The pair is the 2D vector (even, odd), rotated by the 2x2 rotation matrix.
+// After: [even', odd'] = [ even*c - odd*s,  odd*c + even*s ].
+// This is a standard 2D rotation:
+//   [ even' ]   [  cosφ  −sinφ ] [ even ]
+//   [  odd' ] = [  sinφ   cosφ ] [  odd ]
+static inline void rope_rotate_pair(float* even, float* odd, float c, float s) {
+  float e = *even, o = *odd;
+  *even =  e * c - o * s;
+  *odd  =  o * c + e * s;
+}
+
+// Apply standard RoPE to Q and K (GQA-aware), in-place.
+//
+// Shapes:
+//   Q: [T, n_q * head_dim]       (one block of size head_dim per Q head)
+//   K: [T, n_kv * head_dim]      (one block per KV head)
+// Parameters:
+//   pos0  : starting position index (0 for prompt; add cache length during decode)
+//   theta : base rotary θ (Qwen/Qwen2/Qwen3 default is 10000.0)
+// Notes:
+//   • We rotate each head’s (even,odd) pairs across the entire head_dim.
+//   • This matches the RoFormer paper’s formulation: φ(p,m) = (pos0+p) * θ^(−2m/D)
+//     where m = 0..(D/2−1) is the pair index and D=head_dim.
+//   • We precompute inv_freq[m] = θ^(−2m/D) once (like your PyTorch dumper) for
+//     better performance and closer numerical parity with torch.float32.
+//
+// References:
+//   RoFormer / RoPE: Su et al. 2021; Qwen3 uses standard RoPE with θ≈10000.  [oai_citation:2‡arXiv](https://arxiv.org/pdf/2104.09864?utm_source=chatgpt.com)
+void rope_apply_inplace_f32_gqa(
+  float* Q, float* K,
+  int T, int n_q, int n_kv, int head_dim,
+  int pos0, float theta)
+{
+  DBG("[rope] T=%d n_q=%d n_kv=%d head_dim=%d theta=%.1f pos0=%d\n",
+      T, n_q, n_kv, head_dim, theta, pos0);
+
+  const int Dq  = n_q  * head_dim;
+  const int Dkv = n_kv * head_dim;
+  const int npairs = head_dim / 2;
+
+  // Precompute inv_freq[m] = theta^( -2m / head_dim ), m in [0, npairs)
+  float* inv_freq = (float*)malloc(sizeof(float) * npairs);
+  for (int m = 0; m < npairs; ++m) {
+    float exponent = -2.0f * (float)m / (float)head_dim;
+    inv_freq[m] = powf(theta, exponent);
+  }
+
+  // For each token position (absolute index = pos0 + t)
+  for (int t = 0; t < T; ++t) {
+    const int p = pos0 + t;
+
+    // --- Rotate all Q heads at this position ---
+    for (int h = 0; h < n_q; ++h) {
+      float* qh = Q + t*Dq + h*head_dim;
+      // Walk even/odd pairs (0&1, 2&3, ...):
+      for (int i = 0, m = 0; i < head_dim; i += 2, ++m) {
+        float angle = p * inv_freq[m];      // φ = p * inv_freq[m]
+        float c = cosf(angle), s = sinf(angle);
+        rope_rotate_pair(&qh[i], &qh[i+1], c, s);
+      }
+    }
+
+    // --- Rotate all KV heads at this position ---
+    for (int h = 0; h < n_kv; ++h) {
+      float* kh = K + t*Dkv + h*head_dim;
+      for (int i = 0, m = 0; i < head_dim; i += 2, ++m) {
+        float angle = p * inv_freq[m];
+        float c = cosf(angle), s = sinf(angle);
+        rope_rotate_pair(&kh[i], &kh[i+1], c, s);
+      }
+    }
+  }
+
+  free(inv_freq);
+  DBG("[rope] applied\n");
 }

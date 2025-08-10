@@ -194,6 +194,22 @@ Max abs diff: 6.4e-06
 PASS
 ```
 
+### 5. Test RoPE (isolated)
+
+This verifies the rotary math alone (no GEMMs, no weights). It supports GQA layouts.
+
+1) Dump reproducible inputs/outputs:
+```bash
+python3 dump_rope_io.py --seqlen 4 --n_q 32 --n_kv 4 --head_dim 128 \
+  --pos0 0 --theta 10000 --seed 123 --outbase rope_T4_h128
+```
+2.) Run the C test:
+
+```
+./test_rope rope_T4_h128.Q.npy rope_T4_h128.K.npy \
+  rope_T4_h128.YQ.npy rope_T4_h128.YK.npy \
+  4 32 4 128 10000 0
+```
 ---
 
 ## Debug & Bench

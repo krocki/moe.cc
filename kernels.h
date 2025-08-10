@@ -74,4 +74,14 @@ void attn_forward_f32_gqa(
   int n_q, int n_kv, int head_dim, int causal,
   float* scratch, float* y);
 
+// Apply RoPE to Q and K in-place (GQA-aware, no weights).
+// Q: [T, n_q*head_dim], K: [T, n_kv*head_dim]
+// pos0: starting position offset (e.g., for KV-cache decode), usually 0 in tests.
+// theta: base rotary θ (Qwen default 10000.0)
+// Uses kv head mapping kvh = h % n_kv (Qwen-style GQA).
+void rope_apply_inplace_f32_gqa(
+  float* Q, float* K,
+  int T, int n_q, int n_kv, int head_dim,
+  int pos0, float theta);
+
 #endif
