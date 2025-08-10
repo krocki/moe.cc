@@ -38,20 +38,22 @@ def iter_subset(sd, args):
     part = args.part
     pref = f"model.layers.{L}."
 
-    # Normalize experts list
-    experts_str = getattr(args, "experts", None)
+    # Normalize experts filter (string or list from nargs="+")
     experts_set = None
-    if experts_str:
-      if experts_str == "all":
-        experts_set = None
+    if part == "mlp" and getattr(args, "experts", None):
+      toks = []
+      src = args.experts
+      if isinstance(src, list):
+        for item in src:
+          toks.extend(s.strip() for s in item.split(",") if s.strip())
       else:
-        if isinstance(experts_str, list):
-          flat = []
-          for item in experts_str:
-            flat.extend(item.split(","))
-          experts_str = ",".join(flat)
-        ids = [s for s in experts_str.split(",") if s.strip() != ""]
-        experts_set = set(int(x) for x in ids)
+        toks = [s.strip() for s in str(src).split(",") if s.strip()]
+
+      # Handle "all"
+      if len(toks) == 1 and toks[0].lower() == "all":
+        experts_set = None  # keep all experts
+      else:
+        experts_set = set(int(x) for x in toks)
 
     for k,t in sd.items():
       if not k.startswith(pref): continue

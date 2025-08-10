@@ -485,3 +485,93 @@ void rope_apply_inplace_f32_gqa(
   free(inv_freq);
   DBG("[rope] applied\n");
 }
+
+// One transformer layer (fp32, no KV-cache).
+// Pipeline: x -> RMSNorm1 -> Attn(GQA + QK-Norm + RoPE) -> +resid
+//        -> RMSNorm2 -> MoE(router+experts) -> +resid
+void layer_forward_f32(
+  float* x, int T, int d_model,
+  // Norm1
+  const float* w_norm1, float eps1,
+  // Attn (GQA)
+  const float* Wq,const float* bq,
+  const float* Wk,const float* bk,
+  const float* Wv,const float* bv,
+  const float* Wo,const float* bo,
+  const float* q_norm, const float* k_norm,
+  int n_q, int n_kv, int head_dim, int causal, float rope_theta,
+  // Norm2
+  const float* w_norm2, float eps2,
+  // MoE
+  const float* router_w, const float* router_b,
+  const float** Wg_arr,const float** bg_arr,
+  const float** Wu_arr,const float** bu_arr,
+  const float** Wd_arr,const float** bd_arr,
+  int E, int k, int d_ff,
+  // scratch
+  float* scratch_attn, float* scratch_moe, int* top_idx, float* top_p)
+{
+  TIMER_DECL; double ms = 0.0;
+  DBG("[layer] T=%d d_model=%d n_q=%d n_kv=%d d=%d E=%d k=%d d_ff=%d\n",
+      T, d_model, n_q, n_kv, head_dim, E, k, d_ff);
+
+  // Temps
+  float* x_norm1       = (float*)malloc(sizeof(float)*T*d_model);
+  float* attn_out      = (float*)malloc(sizeof(float)*T*d_model);
+  float* x_after_attn  = (float*)malloc(sizeof(float)*T*d_model);
+  float* x_norm2       = (float*)malloc(sizeof(float)*T*d_model);
+  float* moe_out       = (float*)malloc(sizeof(float)*T*d_model);
+
+  // 1) RMSNorm before attention
+  DBG("[layer] rmsnorm1\n");
+  TIMER_START();
+  rmsnorm_forward_f32(x, w_norm1, T, d_model, eps1, x_norm1);
+  TIMER_END_MS(ms);
+  DBG("[layer] rmsnorm1 done in %.3f ms\n", ms);
+
+  // 2) Attention (your attn kernel already: QK-Norm -> RoPE -> scores)
+  DBG("[layer] attention\n");
+  TIMER_START();
+  attn_forward_f32_gqa(
+    x_norm1, T, d_model,
+    Wq,bq, Wk,bk, Wv,bv, Wo,bo,
+    q_norm, k_norm,
+    n_q, n_kv, head_dim, causal,
+    scratch_attn, attn_out
+  );
+  TIMER_END_MS(ms);
+  DBG("[layer] attention done in %.3f ms\n", ms);
+
+  // Residual add (x = x + attn_out)
+  for (int i=0; i<T*d_model; ++i) x_after_attn[i] = x[i] + attn_out[i];
+
+  // 3) RMSNorm before MoE
+  DBG("[layer] rmsnorm2\n");
+  TIMER_START();
+  rmsnorm_forward_f32(x_after_attn, w_norm2, T, d_model, eps2, x_norm2);
+  TIMER_END_MS(ms);
+  DBG("[layer] rmsnorm2 done in %.3f ms\n", ms);
+
+  // 4) MoE block
+  DBG("[layer] moe (routing + experts)\n");
+  TIMER_START();
+  // scratch_moe usage: tmp_g = scratch_moe, tmp_u = scratch_moe + d_ff
+  moe_forward_f32_mode(
+    x_norm2, T, d_model,          // <-- match the working prototype
+    router_w, router_b,
+    E, k, d_ff, ROUTER_TOPK_KONLY,
+    Wg_arr, bg_arr, Wu_arr, bu_arr, Wd_arr, bd_arr,
+    moe_out,                      // y
+    scratch_moe,                  // tmp_g
+    scratch_moe + d_ff,           // tmp_u
+    top_idx, top_p
+  );
+  TIMER_END_MS(ms);
+  DBG("[layer] moe done in %.3f ms\n", ms);
+
+  // Residual add (final x = x_after_attn + moe_out)
+  for (int i=0; i<T*d_model; ++i) x[i] = x_after_attn[i] + moe_out[i];
+
+  free(x_norm1); free(attn_out); free(x_after_attn);
+  free(x_norm2); free(moe_out);
+}

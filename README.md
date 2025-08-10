@@ -219,6 +219,129 @@ Max abs diff: 6.4373e-06
 PASS
 ```
 
+### 6. Test full fp32 decoder layer (norm → GQA attn + QK‑Norm + RoPE → MoE)
+
+1) Dump layer I/O
+```
+python3 dump_layer_io.py --model Qwen/Qwen3-30B-A3B \
+  --layer 0 --seqlen 1 --seed 123 --causal 1 \
+  --outbase qwen3_L0_LAYER
+```
+
+2) Dump weights
+```
+python3 export.py --model Qwen/Qwen3-30B-A3B --out l0_norms.bin --layer 0 --part norms --quant none
+python3 export.py --model Qwen/Qwen3-30B-A3B --out l0_attn.bin  --layer 0 --part attn  --quant none
+python3 export.py --model Qwen/Qwen3-30B-A3B --out l0_moe.bin   --layer 0 --part mlp   --experts all --quant none
+```
+
+3) Merge weights
+
+```
+python3 merge_bins.py l0_layer.bin l0_norms.bin l0_attn.bin l0_moe.bin
+```
+Expect: `Wrote l0_layer.bin with 393 tensors from 3 files`
+
+4) Run the C test for layer
+
+```
+./test_layer l0_layer.bin qwen3_L0_LAYER.x.npy qwen3_L0_LAYER.y.npy 0
+```
+
+Expect:
+```
+[layer] T=1 d_model=2048 n_q=32 n_kv=4 d=128 E=128 k=8 d_ff=768
+[layer] rmsnorm1
+[rmsnorm] T=1 d_model=2048 eps=1e-06
+[rmsnorm] done in 0.004 ms
+[layer] rmsnorm1 done in 0.008 ms
+[layer] attention                                                                       
+[attn/gqa] T=1 d_model=2048 n_q=32 n_kv=4 head_dim=128 causal=1
+[matmul] A[1,2048] * W^T[4096,2048] -> Y[1,4096]
+[matmul] done in 7.247 ms
+[matmul] A[1,2048] * W^T[512,2048] -> Y[1,512]
+[matmul] done in 0.910 ms                                                               
+[matmul] A[1,2048] * W^T[512,2048] -> Y[1,512]
+[matmul] done in 0.914 ms                                                               
+[attn/gqa] proj+norm done in 9.084 ms
+[rope] T=1 n_q=32 n_kv=4 head_dim=128 theta=10000.0 pos0=0
+[rope] applied           
+[matmul] A[1,4096] * W^T[2048,4096] -> Y[1,2048]
+[matmul] done in 7.543 ms                                                               
+[attn/gqa] out_proj done in 7.547 ms
+[layer] attention done in 16.650 ms                                                     
+[layer] rmsnorm2         
+[rmsnorm] T=1 d_model=2048 eps=1e-06                                                    
+[rmsnorm] done in 0.005 ms
+[layer] rmsnorm2 done in 0.006 ms
+[layer] moe (routing + experts)                                                         
+[moe] T=1 d_model=2048 E=128 k=8 d_ff=768 mode=0
+[matmul] A[1,2048] * W^T[128,2048] -> Y[1,128]
+[matmul] done in 0.247 ms
+[router] T=1 E=128 k=8 (topk logits + softmax over k)
+[router] t=0 topk: (34:0.1446) (32:0.1407) (5:0.1352) (2:0.1259) (39:0.1185) (29:0.1147) (74:0.1110) (52:0.1094)                                                                 
+[router] routing done in 0.009 ms
+[moe] t=0 expert=34 prob=0.144554                                                       
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.370 ms                                                               
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.372 ms                                                               
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.224 ms        
+[moe] t=0 expert=32 prob=0.140730                                                       
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.369 ms                                                               
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.373 ms                                                               
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.221 ms    
+[moe] t=0 expert=5 prob=0.135172
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.366 ms
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.374 ms
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.211 ms
+[moe] t=0 expert=2 prob=0.125855
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.367 ms
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.390 ms
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.199 ms
+[moe] t=0 expert=39 prob=0.118541
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.375 ms
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.368 ms
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.123 ms
+[moe] t=0 expert=29 prob=0.114675
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.282 ms
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.359 ms
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.235 ms
+[moe] t=0 expert=74 prob=0.111046
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.360 ms
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.382 ms
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.210 ms
+[moe] t=0 expert=52 prob=0.109429
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.296 ms
+[matmul] A[1,2048] * W^T[768,2048] -> Y[1,768]
+[matmul] done in 1.298 ms
+[matmul] A[1,768] * W^T[2048,768] -> Y[1,2048]
+[matmul] done in 1.192 ms
+[layer] moe done in 31.684 ms
+Max abs diff: 2.38419e-07
+PASS
+```
+
 ---
 
 ## Debug & Bench
