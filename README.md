@@ -163,14 +163,31 @@ python3 dump_rmsnorm_io.py --model Qwen/Qwen3-30B-A3B \
 # Expect ~1e-7 → PASS
 ```
 
-### 4. Test attention (GQA) block
+### 4. Test RoPE (isolated)
+
+This verifies the rotary math alone (no GEMMs, no weights). It supports GQA layouts.
+
+1) Dump reproducible inputs/outputs:
+```bash
+python3 dump_rope_io.py --seqlen 4 --n_q 32 --n_kv 4 --head_dim 128 \
+  --pos0 0 --theta 10000 --seed 123 --outbase rope_T4_h128
+```
+2.) Run the C test:
+
+```
+./test_rope rope_T4_h128.Q.npy rope_T4_h128.K.npy \
+  rope_T4_h128.YQ.npy rope_T4_h128.YK.npy \
+  4 32 4 128 10000 0
+```
+
+### 5. Test attention (GQA) block
 
 > Note: This path is RoPE‑free, so keep `--seqlen 1` to match the dumper.
 
 1) Dump attention I/O for a given layer (example: layer 0, causal mask on):
 ```bash
 python3 dump_attn_io.py --model Qwen/Qwen3-30B-A3B \
-  --layer 0 --seqlen 1 --seed 123 --causal 1 \
+  --layer 0 --seqlen 1 --seed 123 --causal 1 --rope 1 \
   --outbase qwen3_L0_ATTN
 ```
 
@@ -189,27 +206,19 @@ Example output:
 ```
 [attn/gqa] T=1 d_model=2048 n_q=32 n_kv=4 head_dim=128 causal=1
 [matmul] A[1,2048] * W^T[4096,2048] -> Y[1,4096]
-...
-Max abs diff: 6.4e-06
+[matmul] done in 16.475 ms
+[matmul] A[1,2048] * W^T[512,2048] -> Y[1,512]
+[matmul] done in 1.757 ms
+[matmul] A[1,2048] * W^T[512,2048] -> Y[1,512]
+[matmul] done in 1.595 ms
+[attn/gqa] proj+norm done in 19.860 ms
+[matmul] A[1,4096] * W^T[2048,4096] -> Y[1,2048]
+[matmul] done in 12.352 ms
+[attn/gqa] out_proj done in 12.357 ms
+Max abs diff: 6.4373e-06
 PASS
 ```
 
-### 5. Test RoPE (isolated)
-
-This verifies the rotary math alone (no GEMMs, no weights). It supports GQA layouts.
-
-1) Dump reproducible inputs/outputs:
-```bash
-python3 dump_rope_io.py --seqlen 4 --n_q 32 --n_kv 4 --head_dim 128 \
-  --pos0 0 --theta 10000 --seed 123 --outbase rope_T4_h128
-```
-2.) Run the C test:
-
-```
-./test_rope rope_T4_h128.Q.npy rope_T4_h128.K.npy \
-  rope_T4_h128.YQ.npy rope_T4_h128.YK.npy \
-  4 32 4 128 10000 0
-```
 ---
 
 ## Debug & Bench

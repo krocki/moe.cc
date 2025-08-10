@@ -355,6 +355,14 @@ void attn_forward_f32_gqa(
   DBG("[attn/gqa] proj+norm done in %.3f ms\n", ms);
 #endif
 
+  rope_apply_inplace_f32_gqa(
+    Q, K,
+    T, n_q, n_kv, head_dim,
+    /*pos0=*/0, /*theta=*/10000.0f
+  );
+
+  // Now proceed to attention scores
+
   // Zero Hcat
   for (int i=0; i<T*Dq; ++i) Hcat[i] = 0.f;
 
