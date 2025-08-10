@@ -20,3 +20,11 @@ python3 dump_expert_io.py --model Qwen/Qwen3-30B-A3B --layer 0 --expert 0 --seql
 ./test_expert l0_e0.bin qwen3_L0_E0.x.npy qwen3_L0_E0.y.npy
 ```
 
+### MoE block test
+
+```
+python dump_moe_io.py --model Qwen/Qwen3-30B-A3B --layer 0 --seqlen 1 --seed 123 --topk 8 --outbase qwen3_L0_MOE
+python3 export.py --model Qwen/Qwen3-30B-A3B --out l0_moe.bin --layer 0 --part mlp --experts $(paste -sd, qwen3_L0_MOE.experts.txt) --quant none
+
+./test_moe_block l0_moe.bin qwen3_L0_MOE.x.npy qwen3_L0_MOE.y.npy
+```

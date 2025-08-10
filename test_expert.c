@@ -1,54 +1,13 @@
 // test_expert.c
-// 2-space indentation, using io.h (not including io.c).
+// 2-space indentation, modular includes.
 // Build: make
 // Run:   ./test_expert l0_e0.bin qwen3_L0_E0.x.npy qwen3_L0_E0.y.npy
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
-#include <string.h>
 #include "io.h"
-
-static void matmul_add_bias_f32(
-  const float* A, const float* W, const float* b,
-  float* Y, int M, int K, int N)
-{
-  for (int m = 0; m < M; ++m) {
-    const float* a = A + m*K;
-    float* y = Y + m*N;
-    for (int n = 0; n < N; ++n) {
-      const float* w = W + n*K;
-      float acc = b ? b[n] : 0.f;
-      for (int k = 0; k < K; ++k) acc += a[k] * w[k];
-      y[n] = acc;
-    }
-  }
-}
-
-static inline float silu(float x){ return x / (1.0f + expf(-x)); }
-
-static void expert_forward_f32(
-  const float* x, int T, int d_model, int d_ff,
-  const float* Wg, const float* bg,
-  const float* Wu, const float* bu,
-  const float* Wd, const float* bd,
-  float* y, float* tmp_g, float* tmp_u)
-{
-  matmul_add_bias_f32(x, Wg, bg, tmp_g, T, d_model, d_ff);
-  matmul_add_bias_f32(x, Wu, bu, tmp_u, T, d_model, d_ff);
-  int n = T * d_ff;
-  for (int i = 0; i < n; ++i) tmp_g[i] = silu(tmp_g[i]) * tmp_u[i];
-  matmul_add_bias_f32(tmp_g, Wd, bd, y, T, d_ff, d_model);
-}
-
-static float max_abs_diff(const float* a, const float* b, int n){
-  float m = 0.f;
-  for (int i=0;i<n;i++){
-    float d = fabsf(a[i]-b[i]);
-    if (d>m) m=d;
-  }
-  return m;
-}
+#include "kernels.h"
+#include "utils.h"
 
 int main(int argc, char** argv){
   if (argc < 4){
@@ -84,7 +43,6 @@ int main(int argc, char** argv){
   NpyArray* xin = npy_load_float32(xpath);
   NpyArray* ygd = npy_load_float32(ypath);
   if (!xin || !ygd){ fprintf(stderr, "Failed to load .npy\n"); return 1; }
-
   if (xin->ndim!=2 || xin->shape[1]!=d_model){
     fprintf(stderr, "x.npy shape mismatch: expected [T,%d], got [%d,%d]\n",
             d_model, xin->shape[0], xin->shape[1]);
