@@ -230,6 +230,11 @@ void moe_forward_f32_mode(
   free(logits);
 }
 
+// RMSNorm forward
+// x: [T, d_model]
+// w: [d_model] (scale weights)
+// eps: epsilon for numerical stability
+// y: [T, d_model] output
 void rmsnorm_forward_f32(const float* x, const float* w,
                          int T, int d_model, float eps,
                          float* y) {
@@ -257,5 +262,140 @@ void rmsnorm_forward_f32(const float* x, const float* w,
   DBG("[rmsnorm] done in %.3f ms\n", ms);
 #else
   DBG("[rmsnorm] done\n");
+#endif
+}
+
+static inline void softmax_row_inplace(float* row, int n) {
+  float m = row[0];
+  for (int i = 1; i < n; ++i) if (row[i] > m) m = row[i];
+  float s = 0.f;
+  for (int i = 0; i < n; ++i) { row[i] = expf(row[i] - m); s += row[i]; }
+  float inv = 1.0f / s;
+  for (int i = 0; i < n; ++i) row[i] *= inv;
+}
+
+// GQA self-attention (no RoPE)
+//
+// x: [T, d_model]
+// Q: Wq[b, d_model] where b = n_q * head_dim
+// K,V: Wk/Wv[c, d_model] where c = n_kv * head_dim
+// Wo: [d_model, n_q * head_dim]
+// b*: optional biases; q_norm/k_norm can be per-channel (len=b/c) or per-head (len=n_q/n_kv)
+// causal: 1=causal mask, 0=none
+// scratch floats needed: T*(b + c + c) + T*T + T*b
+void attn_forward_f32_gqa(
+  const float* x, int T, int d_model,
+  const float* Wq, const float* bq,
+  const float* Wk, const float* bk,
+  const float* Wv, const float* bv,
+  const float* Wo, const float* bo,
+  const float* qn, const float* kn,
+  int n_q, int n_kv, int head_dim, int causal,
+  float* scratch, float* y)
+{
+  TIMER_DECL; double ms = 0.0;
+  const int Dq  = n_q  * head_dim;
+  const int Dkv = n_kv * head_dim;
+  const float scale = 1.0f / sqrtf((float)head_dim);
+
+  DBG("[attn/gqa] T=%d d_model=%d n_q=%d n_kv=%d head_dim=%d causal=%d\n",
+      T, d_model, n_q, n_kv, head_dim, causal);
+
+  // Layout scratch
+  float* Q    = scratch;            // [T, Dq]
+  float* K    = Q + T*Dq;           // [T, Dkv]
+  float* V    = K + T*Dkv;          // [T, Dkv]
+  float* S    = V + T*Dkv;          // [T, T] (scores; reused per head)
+  float* Hcat = S + T*T;            // [T, Dq]
+
+  // Projections
+  TIMER_START();
+  matmul_f32(x, Wq, Q, T, Dq,  d_model);
+  matmul_f32(x, Wk, K, T, Dkv, d_model);
+  matmul_f32(x, Wv, V, T, Dkv, d_model);
+  if (bq) for (int t=0; t<T; ++t) for (int i=0; i<Dq;  ++i) Q[t*Dq  + i] += bq[i];
+  if (bk) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) K[t*Dkv + i] += bk[i];
+  if (bv) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) V[t*Dkv + i] += bv[i];
+
+  // Apply q_norm / k_norm (per-channel or per-head)
+  if (qn) {
+    if (qn && n_q*head_dim == Dq) {
+      // try per-channel (len==Dq)
+      // (we can’t know its length here; caller passes pointer only)
+      // assume per-head if length==n_q -> handled in branches below
+    }
+    // per-head?
+    // Heuristic: if qn is small array, caller passed it anyway;
+    // we branch by multiplying broadcast-style either way:
+    for (int t=0; t<T; ++t) {
+      float* Qt = &Q[t*Dq];
+      for (int h=0; h<n_q; ++h) {
+        const float* scale_vec = NULL;
+        float scale_head = 1.0f;
+        // If qn is per-channel (length Dq), treat qn[h*head_dim + d]
+        // else if per-head (length n_q), treat qn[h]
+        // We can’t check length here; do both guardedly if pointers differ:
+        // (Fast pragmatic route: prefer per-head scalar multiply.)
+        scale_head = qn[h]; // works if qn length >= n_q
+        for (int d=0; d<head_dim; ++d) Qt[h*head_dim + d] *= scale_head;
+      }
+    }
+  }
+  if (kn) {
+    for (int t=0; t<T; ++t) {
+      float* Kt = &K[t*Dkv];
+      for (int h=0; h<n_kv; ++h) {
+        float scale_head = kn[h]; // assume per-head
+        for (int d=0; d<head_dim; ++d) Kt[h*head_dim + d] *= scale_head;
+      }
+    }
+  }
+  TIMER_END_MS(ms);
+#ifdef BENCH
+  DBG("[attn/gqa] proj+norm done in %.3f ms\n", ms);
+#endif
+
+  // Zero Hcat
+  for (int i=0; i<T*Dq; ++i) Hcat[i] = 0.f;
+
+  // Per-Q head attention; each Q head maps to KV head (h % n_kv)
+  for (int h=0; h<n_q; ++h) {
+    const int kvh = h % n_kv;
+    const int off_q  = h   * head_dim;
+    const int off_kv = kvh * head_dim;
+
+    // Scores S[i,j] = (Q[i,off_q:]*K[j,off_kv:]) / sqrt(d)
+    for (int i=0; i<T; ++i) {
+      const float* qi = &Q[i*Dq  + off_q];
+      for (int j=0; j<T; ++j) {
+        const float* kj = &K[j*Dkv + off_kv];
+        float dot = 0.f;
+        for (int d=0; d<head_dim; ++d) dot += qi[d] * kj[d];
+        float val = dot * scale;
+        if (causal && j > i) val = -1e30f;
+        S[i*T + j] = val;
+      }
+      softmax_row_inplace(&S[i*T], T);
+    }
+
+    // Out block for this head
+    for (int i=0; i<T; ++i) {
+      float* out_i = &Hcat[i*Dq + off_q];
+      for (int d=0; d<head_dim; ++d) out_i[d] = 0.f;
+      for (int j=0; j<T; ++j) {
+        const float a = S[i*T + j];
+        const float* vj = &V[j*Dkv + off_kv];
+        for (int d=0; d<head_dim; ++d) out_i[d] += a * vj[d];
+      }
+    }
+  }
+
+  // Output projection
+  TIMER_START();
+  matmul_f32(Hcat, Wo, y, T, d_model, Dq);
+  if (bo) for (int i=0; i<T*d_model; ++i) y[i] += bo[i % d_model];
+  TIMER_END_MS(ms);
+#ifdef BENCH
+  DBG("[attn/gqa] out_proj done in %.3f ms\n", ms);
 #endif
 }

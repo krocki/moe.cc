@@ -163,6 +163,37 @@ python3 dump_rmsnorm_io.py --model Qwen/Qwen3-30B-A3B \
 # Expect ~1e-7 → PASS
 ```
 
+### 4. Test attention (GQA) block
+
+> Note: This path is RoPE‑free, so keep `--seqlen 1` to match the dumper.
+
+1) Dump attention I/O for a given layer (example: layer 0, causal mask on):
+```bash
+python3 dump_attn_io.py --model Qwen/Qwen3-30B-A3B \
+  --layer 0 --seqlen 1 --seed 123 --causal 1 \
+  --outbase qwen3_L0_ATTN
+```
+
+2) Export the attention weights
+```
+python3 export.py --model Qwen/Qwen3-30B-A3B \
+  --out l0_attn.bin --layer 0 --part attn --quant none
+```
+
+3) Run the C test for GQA attention (last arg is causal flag: 1=causal, 0=non‑causal):
+
+```
+./test_attn l0_attn.bin qwen3_L0_ATTN.x.npy qwen3_L0_ATTN.y.npy 1
+```
+Example output:
+```
+[attn/gqa] T=1 d_model=2048 n_q=32 n_kv=4 head_dim=128 causal=1
+[matmul] A[1,2048] * W^T[4096,2048] -> Y[1,4096]
+...
+Max abs diff: 6.4e-06
+PASS
+```
+
 ---
 
 ## Debug & Bench
