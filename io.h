@@ -1,4 +1,4 @@
-// io.h
+
 #ifndef IO_H
 #define IO_H
 
@@ -35,4 +35,3 @@ NpyArray* npy_load_float32(const char* path);
 void npy_free(NpyArray* a);
 
 #endif // IO_H
-
