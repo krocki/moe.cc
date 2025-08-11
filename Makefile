@@ -6,9 +6,6 @@ OBJS = io.o utils.o kernels.o
 
 all: test_embed test_head test_stack test_expert test_moe_block test_rmsnorm test_attn test_rope test_layer test_model test-model-v0 list_bin
 
-test_embed: test_embed.o io.o utils.o
-	$(CC) $(CFLAGS) -o $@ $^ -lm
-
 test_expert: test_expert.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 

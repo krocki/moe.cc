@@ -1,12 +1,32 @@
-
 #define _POSIX_C_SOURCE 200809L
 #include "io.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
+
+// ---- progress timing state & helpers ----
+static struct timespec g_progress_start;
+static int g_progress_started = 0;
+static size_t g_progress_total = 0;
+
+static double ts_to_sec(struct timespec t){ return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
+static double now_monotonic(){
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return ts_to_sec(t);
+}
+
+// Formats seconds as H:MM:SS into buf
+static void format_hms(double seconds, char* buf, size_t buflen){
+  if (seconds < 0 || !isfinite(seconds)) { snprintf(buf, buflen, "--:--:--"); return; }
+  long s = (long)(seconds + 0.5);
+  long h = s / 3600; s %= 3600;
+  long m = s / 60;   s %= 60;
+  snprintf(buf, buflen, "%ldh:%02ldm:%02lds", h, m, s);
+}
 
 static uint32_t read_u32(FILE* f){
   uint32_t v;
@@ -27,14 +47,34 @@ static void read_exact(FILE* f, void* buf, size_t n){
 // -------- progress bar (in-place, no env var) --------
 static void progress_draw(size_t done, size_t total){
   if (!total) return;  // nothing to show (e.g., non-regular file)
+
+  if (!g_progress_started){
+    clock_gettime(CLOCK_MONOTONIC, &g_progress_start);
+    g_progress_started = 1;
+    g_progress_total = total;
+  }
+
+  double t_now = now_monotonic();
+  double t_start = ts_to_sec(g_progress_start);
+  double elapsed = t_now - t_start;
+  if (elapsed <= 1e-9) elapsed = 1e-9;
+
+  double done_gb = (double)done / (double)(1<<30);
+  double total_gb = (double)total / (double)(1<<30);
+  double speed_gb_s = done_gb / elapsed;
+  double remaining = (done <= total) ? (double)(total - done) : 0.0;
+  double eta_s = speed_gb_s > 1e-12 ? (remaining / (double)(1<<30)) / speed_gb_s : -1.0;
+  char eta_buf[32]; format_hms(eta_s, eta_buf, sizeof(eta_buf));
+
   int pct = (int)((done * 100.0) / (double)total);
   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
   const int width = 40;
   int fill = (pct * width) / 100;
-  // CSI 2K clears the line; \r returns carriage; redraw single line
+
   fprintf(stderr, "\x1b[2K\rLoading tensors [");
   for (int i = 0; i < width; ++i) fputc(i < fill ? '#' : '.', stderr);
-  fprintf(stderr, "] %3d%%", pct);
+  fprintf(stderr, "] %3d%%  %.1f GiB/s  (%.1f/%.1f GiB)  ETA %s",
+          pct, speed_gb_s, done_gb, total_gb, eta_buf);
   fflush(stderr);
 }
 
@@ -69,6 +109,7 @@ BinFile* bin_load(const char* path){
   bf->arr   = (TensorBin*)xmalloc(sizeof(TensorBin)*nt);
 
   // initial progress snapshot (after header)
+  double t_start = now_monotonic();
   if (total_bytes){
     size_t done = (size_t)ftell(f);
     progress_draw(done, total_bytes);
@@ -112,6 +153,12 @@ BinFile* bin_load(const char* path){
   }
   fclose(f);
   if (total_bytes) progress_done();
+  double t_now = now_monotonic();
+  double elapsed = t_now - t_start;
+  double total_gb = (double)total_bytes / (double)(1<<30);
+  double speed_gb_s = total_gb / elapsed;
+  fprintf(stderr, "%.1f GiB loaded in  %.2f s (%.1f GiB)\n",
+          total_gb, elapsed, speed_gb_s);
   return bf;
 }
 

@@ -199,12 +199,16 @@ def main():
   if Wout is None:  # tied
     Wout = sd["model.embed_tokens.weight"]
   logits = xf @ Wout.float().t()
+  probs  = torch.softmax(logits, dim=-1).contiguous()    # [T, V]
 
   np.save(args.outbase + ".ids.npy", ids.numpy().astype(np.int32))
   np.save(args.outbase + ".x.npy", x.numpy().astype(np.float32))
   np.save(args.outbase + ".y.npy", h.numpy().astype(np.float32))
   np.save(args.outbase + ".logits.npy", logits.numpy().astype(np.float32))
-  print(f"Saved: {args.outbase}.ids/x/y/logits.npy (T={args.seqlen}, L={args.layers}, V={V})")
+  np.save(args.outbase + ".probs.npy",  probs.cpu().numpy().astype(np.float32))
+  top = torch.topk(probs, k=5, dim=-1)
+  print(f"Saved {args.outbase}.ids.npy, .logits.npy, .probs.npy  (T={ids.numel()}, V={logits.size(-1)})")
+  print("Top-5 (t=0):", list(zip(top.indices[0].tolist(), [float(v) for v in top.values[0]])))
 
 if __name__ == "__main__":
   main()
