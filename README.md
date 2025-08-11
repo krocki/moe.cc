@@ -384,6 +384,11 @@ make test_model
   - ms timings for matmuls and routing
 
 ---
+```
+```
+python3 dump_model_io.py --model Qwen/Qwen3-30B-A3B --layers 48 --seqlen 1 --outbase qwen3_FULL
+./test_model all.bin qwen3_FULL.ids.npy qwen3_FULL.logits.npy 48 10000 --nosoftmax
+```
 
 ## Notes
 - Names embedded in `.bin` match Hugging Face keys (e.g. `model.layers.0.mlp.experts.7.up_proj.weight`).  

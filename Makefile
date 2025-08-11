@@ -4,7 +4,7 @@ CFLAGS = -g -O2 -Wall -DDEBUG -DBENCH
 
 OBJS = io.o utils.o kernels.o
 
-all: test_embed test_head test_stack test_expert test_moe_block test_rmsnorm test_attn test_rope test_layer test_model list_bin
+all: test_embed test_head test_stack test_expert test_moe_block test_rmsnorm test_attn test_rope test_layer test_model test-model-v0 list_bin
 
 test_embed: test_embed.o io.o utils.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -35,6 +35,9 @@ test_stack: test_stack.o io.o utils.o kernels.o
 
 test_head: test_head.o io.o utils.o kernels.o
 	$(CC) -O2 -Wall -o $@ $^ -lm
+
+test-model-v0: test-model-v0.o io.o utils.o kernels.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 test_model: test_model.o io.o utils.o kernels.o model.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm

@@ -1,50 +1,210 @@
 #!/usr/bin/env python3
-import argparse, numpy as np, torch, json
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import argparse, numpy as np, torch
+from transformers import AutoModelForCausalLM
 
 @torch.no_grad()
+def run_first_n_layers(model, x, n_layers, theta=10000.0, causal=True):
+  """Match your stack path: RMS-ATTN-RMS-MoE per layer; returns hidden after N layers."""
+  sd = model.state_dict()
+  h = x
+  for L in range(n_layers):
+    # Norm1
+    w1 = sd.get(f"model.layers.{L}.input_layernorm.weight")
+    if w1 is None: w1 = sd.get(f"model.layers.{L}.rms_1.weight")
+    x1 = rmsnorm(h, w1.float(), 1e-6)
+
+    # Attn
+    Wq = sd[f"model.layers.{L}.self_attn.q_proj.weight"].float()
+    Wk = sd[f"model.layers.{L}.self_attn.k_proj.weight"].float()
+    Wv = sd[f"model.layers.{L}.self_attn.v_proj.weight"].float()
+    Wo = sd[f"model.layers.{L}.self_attn.o_proj.weight"].float()
+    bq = (sd.get(f"model.layers.{L}.self_attn.q_proj.bias") or None)
+    bk = (sd.get(f"model.layers.{L}.self_attn.k_proj.bias") or None)
+    bv = (sd.get(f"model.layers.{L}.self_attn.v_proj.bias") or None)
+    bo = (sd.get(f"model.layers.{L}.self_attn.o_proj.bias") or None)
+    bq = bq.float() if bq is not None else None
+    bk = bk.float() if bk is not None else None
+    bv = bv.float() if bv is not None else None
+    bo = bo.float() if bo is not None else None
+
+    qn = sd.get(f"model.layers.{L}.self_attn.q_norm.weight")
+    kn = sd.get(f"model.layers.{L}.self_attn.k_norm.weight")
+    qn = qn.float() if qn is not None else None
+    kn = kn.float() if kn is not None else None
+
+    aout = attn_gqa_block(x1, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, causal, theta)
+    x2 = h + aout
+
+    # Norm2
+    w2 = sd.get(f"model.layers.{L}.post_attention_layernorm.weight")
+    if w2 is None: w2 = sd.get(f"model.layers.{L}.rms_2.weight")
+    x3 = rmsnorm(x2, w2.float(), 1e-6)
+
+    # MoE
+    gate_w = sd.get(f"model.layers.{L}.mlp.gate.weight")
+    if gate_w is None: gate_w = sd.get(f"model.layers.{L}.mlp.router.gate.weight")
+    gate_b = sd.get(f"model.layers.{L}.mlp.gate.bias")
+    if gate_b is None: gate_b = sd.get(f"model.layers.{L}.mlp.router.gate.bias")
+    gate_w = gate_w.float()
+    gate_b = gate_b.float() if gate_b is not None else None
+
+    experts = []
+    e = 0
+    while True:
+      try:
+        Wg = sd[f"model.layers.{L}.mlp.experts.{e}.gate_proj.weight"].float()
+        Wu = sd[f"model.layers.{L}.mlp.experts.{e}.up_proj.weight"].float()
+        Wd = sd[f"model.layers.{L}.mlp.experts.{e}.down_proj.weight"].float()
+        bg = sd.get(f"model.layers.{L}.mlp.experts.{e}.gate_proj.bias")
+        bu = sd.get(f"model.layers.{L}.mlp.experts.{e}.up_proj.bias")
+        bd = sd.get(f"model.layers.{L}.mlp.experts.{e}.down_proj.bias")
+        bg = bg.float() if bg is not None else None
+        bu = bu.float() if bu is not None else None
+        bd = bd.float() if bd is not None else None
+        experts.append(lambda z, Wg=Wg,bg=bg,Wu=Wu,bu=bu,Wd=Wd,bd=bd: swi_glu_expert(z, Wg,bg, Wu,bu, Wd,bd))
+        e += 1
+      except KeyError:
+        break
+
+    h = x2 + moe_block(x3, gate_w, gate_b, experts, k=8)
+  return h
+
+# ==== helpers (identical to your layer/stack scripts) =================================
+
+def infer_head_dim(Dq, Dkv):
+  for d in [128, 96, 80, 64, 48, 40, 32]:
+    if Dq % d == 0 and Dkv % d == 0: return d
+  from math import gcd
+  g = gcd(Dq, Dkv); return g if g > 0 else Dq
+
+@torch.no_grad()
+def rmsnorm(x, w, eps):
+  var = (x * x).mean(dim=-1, keepdim=True)
+  xhat = x * torch.rsqrt(var + eps)
+  return xhat * w
+
+@torch.no_grad()
+def proj(x, W, b):  # x @ W^T + b
+  y = x @ W.t()
+  return y + b if b is not None else y
+
+@torch.no_grad()
+def apply_qk_norm(Q, K, qn, kn, n_q, n_kv, head_dim):
+  T = Q.shape[0]; Dq, Dkv = Q.shape[1], K.shape[1]
+  if qn is not None:
+    if qn.numel() == n_q: Q = Q.view(T,n_q,head_dim) * qn.view(1,n_q,1); Q = Q.view(T,Dq)
+    elif qn.numel() == Dq: Q = Q * qn
+  if kn is not None:
+    if kn.numel() == n_kv: K = K.view(T,n_kv,head_dim) * kn.view(1,n_kv,1); K = K.view(T,Dkv)
+    elif kn.numel() == Dkv: K = K * kn
+  return Q,K
+
+@torch.no_grad()
+def rope(Q, K, n_q, n_kv, head_dim, pos0, theta):
+  T = Q.shape[0]
+  i = torch.arange(0, head_dim, 2, dtype=Q.dtype)
+  base = theta ** (-i / head_dim)
+  p = torch.arange(pos0, pos0 + T, dtype=Q.dtype).unsqueeze(1)
+  ang = p * base
+  c = torch.cos(ang).unsqueeze(-1); s = torch.sin(ang).unsqueeze(-1)
+  def apply(x, H):
+    x = x.view(T,H,head_dim)
+    xe = x[:,:,0::2].transpose(1,2); xo = x[:,:,1::2].transpose(1,2)
+    xe2 =  xe * c - xo * s; xo2 = xo * c + xe * s
+    xe2 = xe2.transpose(1,2); xo2 = xo2.transpose(1,2)
+    y = torch.empty_like(x); y[:,:,0::2] = xe2; y[:,:,1::2] = xo2
+    return y.view(T, H*head_dim)
+  return apply(Q, n_q), apply(K, n_kv)
+
+@torch.no_grad()
+def attn_gqa_block(x, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, causal, theta):
+  T, D = x.shape
+  Dq, Dkv = Wq.shape[0], Wk.shape[0]
+  d = infer_head_dim(Dq, Dkv)
+  n_q = Dq // d; n_kv = Dkv // d
+  Q = proj(x,Wq,bq); K = proj(x,Wk,bk); V = proj(x,Wv,bv)
+  Q,K = apply_qk_norm(Q,K,qn,kn,n_q,n_kv,d)
+  Q,K = rope(Q,K,n_q,n_kv,d, pos0=0, theta=theta)
+  scale = 1.0 / (d**0.5)
+  Hcat = torch.zeros(T, Dq, dtype=x.dtype)
+  Qh = Q.view(T,n_q,d); Kh = K.view(T,n_kv,d); Vh = V.view(T,n_kv,d)
+  for h in range(n_q):
+    kvh = h % n_kv
+    S = (Qh[:,h,:] @ Kh[:,kvh,:].t()) * scale
+    if causal:
+      mask = torch.triu(torch.ones(T,T, dtype=torch.bool), diagonal=1)
+      S.masked_fill_(mask, float('-inf'))
+    P = torch.softmax(S, dim=-1)
+    Hcat[:, h*d:(h+1)*d] = P @ Vh[:,kvh,:]
+  y = Hcat @ Wo.t()
+  return y + (bo if bo is not None else 0)
+
+@torch.no_grad()
+def swi_glu_expert(x, Wg,bg, Wu,bu, Wd,bd):
+  g = x @ Wg.t();  g = g + (bg if bg is not None else 0);  g = torch.nn.functional.silu(g)
+  u = x @ Wu.t();  u = u + (bu if bu is not None else 0)
+  h = g * u
+  y = h @ Wd.t();  y = y + (bd if bd is not None else 0)
+  return y
+
+@torch.no_grad()
+def moe_block(x, gate_w, gate_b, experts, k=8):
+  logits = x @ gate_w.t()
+  if gate_b is not None: logits = logits + gate_b
+  topk = torch.topk(logits, k=k, dim=-1)
+  idx = topk.indices
+  prob = torch.softmax(topk.values, dim=-1)
+  T, D = x.shape
+  y = torch.zeros_like(x)
+  for t in range(T):
+    for i in range(k):
+      e = idx[t,i].item()
+      p = prob[t,i].item()
+      y[t] += p * experts[e](x[t:t+1]).squeeze(0)
+  return y
+
+# ==== main =====================================================================
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument("--model", required=True)
-  ap.add_argument("--seqlen", type=int, default=4)
+  ap.add_argument("--layers", type=int, default=48)
+  ap.add_argument("--seqlen", type=int, default=1)
   ap.add_argument("--seed", type=int, default=123)
+  ap.add_argument("--rope-theta", type=float, default=10000.0)
   ap.add_argument("--outbase", required=True)
   args = ap.parse_args()
 
   torch.manual_seed(args.seed); np.random.seed(args.seed)
-  tok = AutoTokenizer.from_pretrained(args.model)
-  cfg = AutoConfig.from_pretrained(args.model)
-  mdl = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="cpu")
-  vocab = int(cfg.vocab_size)
+  model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="cpu")
+  model.eval()
 
-  # Make a short token sequence deterministically (avoid special tokens conflicts)
-  # Use tokenizer's bos_token_id if available, then a few random-but-valid ids.
-  ids = [tok.bos_token_id if tok.bos_token_id is not None else 1]
-  while len(ids) < args.seqlen:
-    ids.append(int(np.random.randint(low=5, high=vocab-5)))
-  ids = torch.tensor([ids], dtype=torch.long)  # [1,T]
+  V = model.config.vocab_size
+  ids = torch.randint(low=0, high=V, size=(args.seqlen,), dtype=torch.long)
 
-  out = mdl(input_ids=ids)
-  logits = out.logits.squeeze(0).to(torch.float32).cpu().numpy()  # [T,vocab]
+  # post-embed (T, D)
+  Wemb = model.get_input_embeddings().weight.detach().float()
+  x = Wemb.index_select(0, ids).contiguous()
 
-  np.save(args.outbase + ".ids.npy", ids.squeeze(0).cpu().numpy().astype(np.int32))
-  np.save(args.outbase + ".logits.npy", logits.astype(np.float32))
-  meta = {
-    "vocab": vocab,
-    "n_layer": int(cfg.num_hidden_layers),
-    "n_q": int(getattr(cfg, "num_attention_heads", 0)),
-    "n_kv": int(getattr(cfg, "num_key_value_heads", 0) or getattr(cfg, "num_kv_heads", 0)),
-    "hidden_size": int(cfg.hidden_size),
-    "rope_theta": float(getattr(cfg, "rope_theta", 10000.0)),
-    "rms_norm_eps": float(getattr(cfg, "rms_norm_eps", 1e-6)),
-  }
-  with open(args.outbase + ".meta.json", "w") as f:
-    json.dump(meta, f, indent=2)
+  # run N layers (pre-final norm/head)
+  h = run_first_n_layers(model, x.clone(), args.layers, theta=args.rope_theta, causal=True)
 
-  print("Saved:")
-  print(" ", args.outbase + ".ids.npy")
-  print(" ", args.outbase + ".logits.npy")
-  print(" ", args.outbase + ".meta.json")
+  # final norm + head -> logits
+  sd = model.state_dict()
+  w_final = sd.get("model.norm.weight")
+  if w_final is None:
+    sd.get("model.final_layernorm.weight")
+  xf = rmsnorm(h, w_final.float(), 1e-6)
+  Wout = sd.get("lm_head.weight")
+  if Wout is None:  # tied
+    Wout = sd["model.embed_tokens.weight"]
+  logits = xf @ Wout.float().t()
+
+  np.save(args.outbase + ".ids.npy", ids.numpy().astype(np.int32))
+  np.save(args.outbase + ".x.npy", x.numpy().astype(np.float32))
+  np.save(args.outbase + ".y.npy", h.numpy().astype(np.float32))
+  np.save(args.outbase + ".logits.npy", logits.numpy().astype(np.float32))
+  print(f"Saved: {args.outbase}.ids/x/y/logits.npy (T={args.seqlen}, L={args.layers}, V={V})")
 
 if __name__ == "__main__":
   main()

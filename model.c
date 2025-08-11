@@ -1,108 +1,87 @@
+#include <math.h>
 #include <stdlib.h>
-#include <string.h>
-#include "model.h"
-#include "utils.h"
-
-#ifdef DEBUG
 #include <stdio.h>
-#define DBG(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
-#else
-#define DBG(...)
-#endif
+#include <string.h>
+#include "kernels.h"
+#include "model.h"
 
-#ifdef BENCH
-#include <time.h>
-#define TIMER_START() \
-  struct timespec t0, t1; \
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-#define TIMER_END_MS(ms) \
-  clock_gettime(CLOCK_MONOTONIC, &t1); \
-  ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + \
-       (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
-#else
-#define TIMER_START()
-#define TIMER_END_MS(ms)
-#endif
-
-// --- tiny helpers using your kernels ---
-
-// Gather embeddings for ids[0..T-1] -> x[T,d_model]
-static void embed_lookup_f32(const float* Wemb, const int* ids,
-                             int T, int d_model, float* x) {
-  double ms=0.0;
-  DBG("[emb] T=%d d_model=%d\n", T, d_model);
-  TIMER_START();
-  for (int t=0; t<T; ++t) {
-    const float* row = Wemb + (size_t)ids[t]*d_model;
-    memcpy(x + (size_t)t*d_model, row, sizeof(float)*d_model);
+// simple per-row softmax (stable)
+static void softmax_rows(float* x, int T, int V){
+  for (int t=0; t<T; ++t){
+    float* r = &x[(size_t)t*V];
+    float m = r[0];
+    for (int i=1;i<V;++i) if (r[i]>m) m=r[i];
+    double s = 0.0;
+    for (int i=0;i<V;++i){ r[i] = expf(r[i]-m); s += r[i]; }
+    float inv = (float)(1.0 / (s + 1e-9));
+    for (int i=0;i<V;++i) r[i] *= inv;
   }
-  TIMER_END_MS(ms);
-  DBG("[emb] done in %.3f ms\n", ms);
 }
 
-// logits[T,vocab] = x[T,d_model] @ Wout[vocab,d_model]^T
-static void lm_head_forward_f32(const float* x, const float* Wout,
-                                int T, int d_model, int vocab,
-                                float* logits) {
-  double ms=0.0;
-  DBG("[lm_head] T=%d d_model=%d vocab=%d\n", T, d_model, vocab);
-  TIMER_START();
-  // reuse your matmul kernel: C[M,N] = A[M,K] x B[N,K]^T
-  matmul_f32(x, Wout, logits, T, vocab, d_model);
-  TIMER_END_MS(ms);
-  DBG("[lm_head] done in %.3f ms\n", ms);
-}
+void model_forward_f32(
+  const int* ids, int T,
+  const QwenConfig* cfg,
+  const QwenWeights* w,
+  int apply_softmax,
+  float* out_logits // [T, vocab]
+){
+  const int D    = cfg->d_model;
+  const int V    = cfg->vocab_size;
+  const int L    = cfg->n_layers;
+  const int d_ff = cfg->d_ff;
+  const int n_q  = cfg->n_q;
+  const int n_kv = cfg->n_kv;
+  const int dh   = cfg->head_dim;
 
-void model_forward_f32(const QwenConfig* cfg, const QwenWeights* W,
-                       const int* ids, int T,
-                       float* logits_out) {
-  const int D = cfg->d_model;
-  const int V = cfg->vocab;
+  // scratch for the whole forward (reuse layer_forward scratch layout)
+  // we size for layer 0 shapes (constant for Qwen3)
+  const int Dq0  = n_q  * dh;
+  const int Dkv0 = n_kv * dh;
 
-  // Scratch
-  float* x         = (float*)malloc(sizeof(float)*T*D);
-  float* x_final   = (float*)malloc(sizeof(float)*T*D);
-  // attn scratch as in your test_attn: T*(Dq + Dkv + Dkv) + T*T + T*Dq
-  const int Dq = cfg->n_q * cfg->head_dim;
-  const int Dkv= cfg->n_kv * cfg->head_dim;
-  float* scratch_attn = (float*)malloc(sizeof(float) * ((size_t)T*(Dq + Dkv + Dkv) + (size_t)T*T + (size_t)T*Dq));
-  // moe scratch: per-token tmp_g/tmp_u reused
-  float* scratch_moe  = (float*)malloc(sizeof(float) * (2 * T * cfg->d_ff));
-  int*   top_idx      = (int*)malloc(sizeof(int) * T * cfg->top_k);
-  float* top_p        = (float*)malloc(sizeof(float) * T * cfg->top_k);
+  size_t attn_f  = (size_t)T*(Dq0 + 2*Dkv0) + (size_t)T*T + (size_t)T*Dq0;
+  size_t temps_f = 5ull * (size_t)T * D;
+  float* scratch_attn = (float*)malloc(sizeof(float)*(attn_f + temps_f));
+  float* scratch_moe  = (float*)malloc(sizeof(float)*(2ull*(size_t)T*d_ff));
+  int*   top_idx      = (int*)  malloc(sizeof(int)*T*cfg->top_k);
+  float* top_p        = (float*)malloc(sizeof(float)*T*cfg->top_k);
 
-  // 0) Embedding
-  embed_lookup_f32(W->Wemb, ids, T, D, x);
+  // hidden buffer
+  float* x = (float*)malloc(sizeof(float)*(size_t)T*D);
 
-  // 1) Decoder stack
-  for (int L=0; L<cfg->n_layer; ++L) {
-    QwenLayerWeights* LW = &W->layers[L];
+  // 1) embedding lookup
+  for (int t=0; t<T; ++t){
+    const int id = ids[t];
+    if (id < 0 || id >= V){ fprintf(stderr,"token id %d out of range 0..%d\n", id, V-1); exit(1); }
+    memcpy(&x[(size_t)t*D], &w->tok_emb[(size_t)id*D], sizeof(float)*(size_t)D);
+  }
+
+  // 2) decoder stack
+  for (int l=0; l<L; ++l){
+    const QwenLayerWeights* lw = &w->layers[l];
     layer_forward_f32(
       x, T, D,
-      // Norm1
-      LW->w_norm1, cfg->eps,
-      // Attn (your attn kernel handles QK-Norm + RoPE internally)
-      LW->Wq, LW->bq, LW->Wk, LW->bk, LW->Wv, LW->bv, LW->Wo, LW->bo,
-      LW->q_norm, LW->k_norm,
-      cfg->n_q, cfg->n_kv, cfg->head_dim, /*causal=*/1, cfg->rope_theta,
-      // Norm2
-      LW->w_norm2, cfg->eps,
-      // MoE
-      LW->Wroute, LW->broute,
-      LW->Wg, LW->bg, LW->Wu, LW->bu, LW->Wd, LW->bd,
-      cfg->n_experts, cfg->top_k, cfg->d_ff,
-      // scratch
+      lw->rms1_w, 1e-6f,
+      lw->Wq, lw->bq, lw->Wk, lw->bk, lw->Wv, lw->bv, lw->Wo, lw->bo,
+      lw->q_norm, lw->k_norm,
+      n_q, n_kv, dh, cfg->causal, cfg->rope_theta,
+      lw->rms2_w, 1e-6f,
+      lw->router_w, lw->router_b,
+      lw->Wg, lw->bg, lw->Wu, lw->bu, lw->Wd, lw->bd,
+      cfg->n_experts, cfg->top_k, d_ff,
       scratch_attn, scratch_moe, top_idx, top_p
     );
   }
 
-  // 2) Final RMS norm
-  rmsnorm_forward_f32(x, W->w_final, T, D, cfg->eps, x_final);
+  // 3) final norm + head
+  float* x_final = (float*)malloc(sizeof(float)*(size_t)T*D);
+  rmsnorm_forward_f32(x, w->final_norm_w, T, D, 1e-6f, x_final);
 
-  // 3) LM head (tie to embeddings if Wout==NULL)
-  const float* Wout = (W->Wout ? W->Wout : W->Wemb);
-  lm_head_forward_f32(x_final, Wout, T, D, V, logits_out);
+  const float* Wout = w->lm_head ? w->lm_head : w->tok_emb; // tied if lm_head==NULL
+  matmul_f32(x_final, Wout, out_logits, T, V, D);
 
-  free(x); free(x_final);
+  if (apply_softmax) softmax_rows(out_logits, T, V);
+
+  free(x_final);
+  free(x);
   free(scratch_attn); free(scratch_moe); free(top_idx); free(top_p);
 }

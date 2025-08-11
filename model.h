@@ -1,60 +1,62 @@
 #ifndef MODEL_H
 #define MODEL_H
 
-#include "kernels.h"
+#include <stddef.h>
+#include <stdint.h>
 
-// Minimal runtime config we need for a full forward (no KV cache)
 typedef struct {
-  int d_model;       // e.g., 2048
-  int n_layer;       // 48
-  int n_q;           // 32
-  int n_kv;          // 4
-  int head_dim;      // 128 (d_model * n_q / Dq)
-  int d_ff;          // 768 (Qwen3-30B-A3B MoE FF dim per expert)
-  int n_experts;     // 128
-  int top_k;         // 8
-  int vocab;         // vocab size for lm head
-  float eps;         // 1e-6
-  float rope_theta;  // read from HF config (often 10000.0)
+  // model sizes
+  int d_model;
+  int n_layers;
+  int head_dim;      // per Q head
+  int n_q;           // Q heads per layer (assumed constant across layers)
+  int n_kv;          // KV heads per layer
+  int d_ff;          // MoE FFN hidden size per expert
+  int n_experts;     // total experts per layer
+  int top_k;         // top-k routing
+  int vocab_size;
+  int causal;        // 0/1
+  float rope_theta;
 } QwenConfig;
 
-// Pointers for one layer
 typedef struct {
-  // Norms
-  const float* w_norm1;
-  const float* w_norm2;
-
-  // Attention (GQA + QK-Norm)
+  // attention
   const float* Wq; const float* bq;
   const float* Wk; const float* bk;
   const float* Wv; const float* bv;
   const float* Wo; const float* bo;
-  const float* q_norm;
-  const float* k_norm;
-
-  // MoE router
-  const float* Wroute;
-  const float* broute;
-
-  // Experts (arrays of length n_experts)
-  const float** Wg; const float** bg;
-  const float** Wu; const float** bu;
-  const float** Wd; const float** bd;
+  const float* q_norm; // length = head_dim
+  const float* k_norm; // length = head_dim
+  // norms
+  const float* rms1_w;
+  const float* rms2_w;
+  // router
+  const float* router_w; // [E, d_model]
+  const float* router_b; // [E] or NULL
+  // experts (arrays of E pointers; bias pointers may be NULL)
+  const float** Wg; const float** bg; // [E][d_ff, d_model], [E][d_ff]
+  const float** Wu; const float** bu; // [E][d_ff, d_model], [E][d_ff]
+  const float** Wd; const float** bd; // [E][d_model, d_ff], [E][d_model]
 } QwenLayerWeights;
 
-// Whole-model weights
 typedef struct {
-  const float* Wemb;        // [vocab, d_model]
-  QwenLayerWeights* layers; // array [n_layer]
-  const float* w_final;     // final RMS norm
-  const float* Wout;        // lm_head.weight (if NULL, tie to Wemb)
+  // token embedding (required)
+  const float* tok_emb;     // [vocab, d_model]
+  // final norm (required; Qwen: "model.norm.weight"/"model.final_layernorm.weight")
+  const float* final_norm_w; // [d_model]
+  // output head (optional, falls back to tok_emb if NULL)
+  const float* lm_head;     // [vocab, d_model] or NULL (tied)
+  // layers
+  QwenLayerWeights* layers; // [n_layers]
 } QwenWeights;
 
-// Forward pass for the whole model (fp32, no KV cache)
-// ids: [T] token ids
-// logits_out: [T, vocab]
-void model_forward_f32(const QwenConfig* cfg, const QwenWeights* W,
-                       const int* ids, int T,
-                       float* logits_out);
+// Full forward: ids -> embed -> N layers -> final norm -> logits (optionally softmax)
+void model_forward_f32(
+  const int* ids, int T,
+  const QwenConfig* cfg,
+  const QwenWeights* w,
+  int apply_softmax,   // 0: logits, 1: softmax probs
+  float* out           // [T, vocab]
+);
 
 #endif // MODEL_H
