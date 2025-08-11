@@ -342,6 +342,36 @@ Max abs diff: 2.38419e-07
 PASS
 ```
 
+### 7. Test model (no-kv)
+
+New export:
+```
+# dump EVERYTHING into a directory (no quant for now)
+python3 export.py --model Qwen/Qwen3-30B-A3B \
+  --all --quant none --outdir qwen3-30b-a3_f32
+
+# later, you can quantize some files in-place (e.g., only matmuls) with --quant q8:
+python3 export.py --model Qwen/Qwen3-30B-A3B \
+  --all --quant q8 --outdir qwen3-30b-a3_q8
+
+# merge any dump dir to a single .bin when you want
+python3 merge_dir.py all.bin qwen3-30b-a3_f32
+```
+
+
+```
+# 0) Merge into one file:
+python3 merge_dir.py all.bin qwen3-30b-a3_f32
+
+# 1) Dump a small golden batch
+python3 dump_model_io.py --model Qwen/Qwen3-30B-A3B \
+  --seqlen 4 --seed 123 --outbase qwen3_FULL
+
+# 2) Build
+make test_model
+
+# 3) Run full forward test
+./test_model all.bin qwen3_FULL.ids.npy qwen3_FULL.logits.npy 0
 ---
 
 ## Debug & Bench

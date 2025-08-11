@@ -65,17 +65,21 @@ void expert_forward_f32(const float* x,
                         int T, int d_model, int d_ff,
                         float* tmp_g, float* tmp_u,
                         float* y) {
-  DBG("[expert] T=%d d_model=%d d_ff=%d\n", T, d_model, d_ff);
-  // gate/up
+  // gate
   matmul_f32(x, Wg, tmp_g, T, d_ff, d_model);
-  if (bg) for (int i = 0; i < T*d_ff; ++i) tmp_g[i] += bg[i % d_ff];
+  if (bg) for (int i = 0; i < T*d_ff; i++) tmp_g[i] += bg[i % d_ff];
+  silu_f32(tmp_g, T*d_ff);
+
+  // up
   matmul_f32(x, Wu, tmp_u, T, d_ff, d_model);
-  if (bu) for (int i = 0; i < T*d_ff; ++i) tmp_u[i] += bu[i % d_ff];
-  // SwiGLU
-  for (int i = 0; i < T*d_ff; ++i) tmp_g[i] = tmp_g[i] / (1.f + expf(-tmp_g[i])) * tmp_u[i];
+  if (bu) for (int i = 0; i < T*d_ff; i++) tmp_u[i] += bu[i % d_ff];
+
+  // elementwise mul
+  for (int i = 0; i < T*d_ff; i++) tmp_g[i] *= tmp_u[i];
+
   // down
   matmul_f32(tmp_g, Wd, y, T, d_model, d_ff);
-  if (bd) for (int i = 0; i < T*d_model; ++i) y[i] += bd[i % d_model];
+  if (bd) for (int i = 0; i < T*d_model; i++) y[i] += bd[i % d_model];
 }
 
 // ---- Router helpers ----
@@ -167,7 +171,7 @@ void router_softmax_all_topk(const float* logits, int T, int E, int k,
   free(probs);
 }
 
-// Full MoE forward (per-token loop)
+// MoE forward with selectable routing mode (NULL-safe biases; no per-expert malloc/free)
 void moe_forward_f32_mode(
     const float* x, int T, int d_model,
     const float* router_w, const float* router_b,
@@ -189,6 +193,18 @@ void moe_forward_f32_mode(
     }
   }
 
+  #ifdef DEBUG
+  if (T > 0) {
+    fprintf(stderr, "[router/raw] t=0 top8 (post-mode): ");
+    for (int i = 0; i < k && i < E; ++i) {
+      int e = top_idx[0*k + i];
+      float p = top_p[0*k + i];
+      fprintf(stderr, "(%d:%.4f) ", e, p);
+    }
+    fprintf(stderr, "\n");
+  }
+  #endif
+
   // 2) routing
   TIMER_DECL; double ms=0.0; TIMER_START();
   if (mode == ROUTER_TOPK_KONLY) {
@@ -204,29 +220,32 @@ void moe_forward_f32_mode(
   // 3) expert mix per token
   for (int i = 0; i < T*d_model; ++i) y[i] = 0.f;
 
-  for (int t = 0; t < T; ++t) {
-    const float* xt = x + t*d_model;
-    float* yt = y + t*d_model;
-
-    for (int j = 0; j < k; ++j) {
-      int e = top_idx[t*k + j];
-      float p = top_p[t*k + j];
-#ifdef DEBUG
+  // allocate once and reuse across experts
+  float* tmp_out = (float*)malloc(sizeof(float) * d_model);
+  for (int t=0; t<T; ++t) {
+    for (int i=0; i<k; ++i) {
+      const int e = top_idx[t*k + i];
+      const float p = top_p[t*k + i];
+      if (e < 0 || e >= E) { fprintf(stderr, "router idx %d out of range 0..%d\n", e, E-1); exit(1); }
       DBG("[moe] t=%d expert=%d prob=%.6f\n", t, e, p);
-#endif
-      // expert forward for a single token
-      matmul_f32(xt, Wg_arr[e], tmp_one_g, 1, d_ff, d_model);
-      if (bg_arr && bg_arr[e]) for (int q = 0; q < d_ff; ++q) tmp_one_g[q] += bg_arr[e][q];
-      matmul_f32(xt, Wu_arr[e], tmp_one_u, 1, d_ff, d_model);
-      if (bu_arr && bu_arr[e]) for (int q = 0; q < d_ff; ++q) tmp_one_u[q] += bu_arr[e][q];
-      for (int q = 0; q < d_ff; ++q) tmp_one_g[q] = tmp_one_g[q] / (1.f + expf(-tmp_one_g[q])) * tmp_one_u[q];
-      float* out_e = tmp_one_u; // reuse buffer for output
-      matmul_f32(tmp_one_g, Wd_arr[e], out_e, 1, d_model, d_ff);
-      if (bd_arr && bd_arr[e]) for (int q = 0; q < d_model; ++q) out_e[q] += bd_arr[e][q];
-      for (int q = 0; q < d_model; ++q) yt[q] += p * out_e[q];
+
+      // expert forward (SwiGLU): y = down( silu(gate(x)) * up(x) )
+      matmul_f32(&x[(size_t)t*d_model], Wg_arr[e], tmp_one_g, 1, d_ff, d_model);
+      if (bg_arr[e]) for (int j=0;j<d_ff;++j) tmp_one_g[j] += bg_arr[e][j];
+      silu_f32(tmp_one_g, d_ff);
+
+      matmul_f32(&x[(size_t)t*d_model], Wu_arr[e], tmp_one_u, 1, d_ff, d_model);
+      if (bu_arr[e]) for (int j=0;j<d_ff;++j) tmp_one_u[j] += bu_arr[e][j];
+
+      for (int j=0;j<d_ff;++j) tmp_one_g[j] *= tmp_one_u[j];
+
+      matmul_f32(tmp_one_g, Wd_arr[e], tmp_out, 1, d_model, d_ff);
+      if (bd_arr[e]) for (int j=0;j<d_model;++j) tmp_out[j] += bd_arr[e][j];
+
+      for (int j=0;j<d_model;++j) y[(size_t)t*d_model + j] += p * tmp_out[j];
     }
   }
-
+  free(tmp_out);
   free(logits);
 }
 
@@ -360,48 +379,63 @@ void attn_forward_f32_gqa(
     T, n_q, n_kv, head_dim,
     /*pos0=*/0, /*theta=*/10000.0f
   );
-
-  // Now proceed to attention scores
-
-  // Zero Hcat
-  for (int i=0; i<T*Dq; ++i) Hcat[i] = 0.f;
-
-  // Per-Q head attention; each Q head maps to KV head (h % n_kv)
-  for (int h=0; h<n_q; ++h) {
+  DBG("[attn/gqa] kv-share group=%d\n", n_q / n_kv);
+  // --- GQA attention per head (no explicit K/V replication)
+  // Q: [T, n_q*D], K/V: [T, n_kv*D]
+  // For each query head h, map to key/value head kvh = h % n_kv
+  for (int h = 0; h < n_q; ++h) {
     const int kvh = h % n_kv;
-    const int off_q  = h   * head_dim;
-    const int off_kv = kvh * head_dim;
+    const float* Qh = &Q[ h   * head_dim];     // row 0 of head h (we’ll index by t)
+    const float* Kh = &K[ kvh * head_dim];
+    const float* Vh = &V[ kvh * head_dim];
 
-    // Scores S[i,j] = (Q[i,off_q:]*K[j,off_kv:]) / sqrt(d)
-    for (int i=0; i<T; ++i) {
-      const float* qi = &Q[i*Dq  + off_q];
-      for (int j=0; j<T; ++j) {
-        const float* kj = &K[j*Dkv + off_kv];
+    // Compute scores S[tq, tk] = (Q_h[tq] · K_kvh[tk]) / sqrt(D)
+    // Reuse S as a [T,T] scratch for this head
+    for (int tq = 0; tq < T; ++tq) {
+      const float* qv = &Q[tq * (n_q  * head_dim) + h   * head_dim];
+      float* Sout = &S[tq * T];
+      for (int tk = 0; tk < T; ++tk) {
+        const float* kv = &K[tk * (n_kv * head_dim) + kvh * head_dim];
         float dot = 0.f;
-        for (int d=0; d<head_dim; ++d) dot += qi[d] * kj[d];
-        float val = dot * scale;
-        if (causal && j > i) val = -1e30f;
-        S[i*T + j] = val;
+        for (int d = 0; d < head_dim; ++d) dot += qv[d] * kv[d];
+        Sout[tk] = dot * scale;
       }
-      softmax_row_inplace(&S[i*T], T);
+      // causal mask: zero out future positions
+      if (causal) {
+        for (int tk = tq + 1; tk < T; ++tk) S[tq * T + tk] = -1e30f;
+      }
+      // softmax over tk
+      float maxv = -1e30f;
+      for (int tk = 0; tk < T; ++tk) if (Sout[tk] > maxv) maxv = Sout[tk];
+      float sum = 0.f;
+      for (int tk = 0; tk < T; ++tk) { float e = expf(Sout[tk] - maxv); Sout[tk] = e; sum += e; }
+      float inv = 1.f / (sum + 1e-9f);
+      for (int tk = 0; tk < T; ++tk) Sout[tk] *= inv;
     }
 
-    // Out block for this head
-    for (int i=0; i<T; ++i) {
-      float* out_i = &Hcat[i*Dq + off_q];
-      for (int d=0; d<head_dim; ++d) out_i[d] = 0.f;
-      for (int j=0; j<T; ++j) {
-        const float a = S[i*T + j];
-        const float* vj = &V[j*Dkv + off_kv];
-        for (int d=0; d<head_dim; ++d) out_i[d] += a * vj[d];
+    // Context = P @ V_kvh  -> write into Hcat[:, h*D : (h+1)*D]
+    for (int tq = 0; tq < T; ++tq) {
+      const float* Prow = &S[tq * T];
+      float* out = &Hcat[tq * (n_q * head_dim) + h * head_dim];
+      // zero
+      for (int d = 0; d < head_dim; ++d) out[d] = 0.f;
+      // accumulate \sum_tk P[tq,tk] * V_kvh[tk]
+      for (int tk = 0; tk < T; ++tk) {
+        const float* vv = &V[tk * (n_kv * head_dim) + kvh * head_dim];
+        float p = Prow[tk];
+        for (int d = 0; d < head_dim; ++d) out[d] += p * vv[d];
       }
     }
   }
 
-  // Output projection
+  // Project concatenated heads: Hcat [T, n_q*D] -> y [T, d_model]
   TIMER_START();
-  matmul_f32(Hcat, Wo, y, T, d_model, Dq);
-  if (bo) for (int i=0; i<T*d_model; ++i) y[i] += bo[i % d_model];
+  matmul_f32(Hcat, Wo, y, T, d_model, n_q * head_dim);
+  if (bo) {
+    for (int t = 0; t < T; ++t) {
+      for (int i = 0; i < d_model; ++i) y[t * d_model + i] += bo[i];
+    }
+  }
   TIMER_END_MS(ms);
 #ifdef BENCH
   DBG("[attn/gqa] out_proj done in %.3f ms\n", ms);
@@ -516,11 +550,24 @@ void layer_forward_f32(
       T, d_model, n_q, n_kv, head_dim, E, k, d_ff);
 
   // Temps
-  float* x_norm1       = (float*)malloc(sizeof(float)*T*d_model);
-  float* attn_out      = (float*)malloc(sizeof(float)*T*d_model);
-  float* x_after_attn  = (float*)malloc(sizeof(float)*T*d_model);
-  float* x_norm2       = (float*)malloc(sizeof(float)*T*d_model);
-  float* moe_out       = (float*)malloc(sizeof(float)*T*d_model);
+  //float* x_norm1       = (float*)malloc(sizeof(float)*T*d_model);
+  //float* attn_out      = (float*)malloc(sizeof(float)*T*d_model);
+  //float* x_after_attn  = (float*)malloc(sizeof(float)*T*d_model);
+  //float* x_norm2       = (float*)malloc(sizeof(float)*T*d_model);
+  //float* moe_out       = (float*)malloc(sizeof(float)*T*d_model);
+
+  // ---- Reuse scratch_attn for all d_model-sized temps to avoid heap churn ----
+  // Attn scratch (already reserved by caller): size_attn_floats = T*(b + 2c) + T*T + T*b
+  const int b = n_q * head_dim;
+  const int c = n_kv * head_dim;
+  const size_t size_attn_floats = (size_t)T * (b + 2*c) + (size_t)T*T + (size_t)T*b;
+  float* const attn_scratch_base = scratch_attn;                     // [size_attn_floats]
+  float* const temps_base        = attn_scratch_base + size_attn_floats;
+  float* const x_norm1      = temps_base + 0*(size_t)T*d_model;      // [T,d_model]
+  float* const attn_out     = temps_base + 1*(size_t)T*d_model;      // [T,d_model]
+  float* const x_after_attn = temps_base + 2*(size_t)T*d_model;      // [T,d_model]
+  float* const x_norm2      = temps_base + 3*(size_t)T*d_model;      // [T,d_model]
+  float* const moe_out      = temps_base + 4*(size_t)T*d_model;      // [T,d_model]
 
   // 1) RMSNorm before attention
   DBG("[layer] rmsnorm1\n");
@@ -537,7 +584,8 @@ void layer_forward_f32(
     Wq,bq, Wk,bk, Wv,bv, Wo,bo,
     q_norm, k_norm,
     n_q, n_kv, head_dim, causal,
-    scratch_attn, attn_out
+    //scratch_attn, attn_out
+    attn_scratch_base, attn_out
   );
   TIMER_END_MS(ms);
   DBG("[layer] attention done in %.3f ms\n", ms);
@@ -555,15 +603,17 @@ void layer_forward_f32(
   // 4) MoE block
   DBG("[layer] moe (routing + experts)\n");
   TIMER_START();
-  // scratch_moe usage: tmp_g = scratch_moe, tmp_u = scratch_moe + d_ff
+  // scratch_moe usage: tmp_g = scratch_moe, tmp_u = scratch_moe + T*d_ff
+  float* tmp_g = scratch_moe;
+  float* tmp_u = scratch_moe + (size_t)T*d_ff;
   moe_forward_f32_mode(
-    x_norm2, T, d_model,          // <-- match the working prototype
+    x_norm2, T, d_model,
     router_w, router_b,
     E, k, d_ff, ROUTER_TOPK_KONLY,
     Wg_arr, bg_arr, Wu_arr, bu_arr, Wd_arr, bd_arr,
     moe_out,                      // y
-    scratch_moe,                  // tmp_g
-    scratch_moe + d_ff,           // tmp_u
+    tmp_g,                        // tmp_g [d_ff] per token
+    tmp_u,                        // tmp_u [d_ff] per token
     top_idx, top_p
   );
   TIMER_END_MS(ms);
@@ -572,6 +622,6 @@ void layer_forward_f32(
   // Residual add (final x = x_after_attn + moe_out)
   for (int i=0; i<T*d_model; ++i) x[i] = x_after_attn[i] + moe_out[i];
 
-  free(x_norm1); free(attn_out); free(x_after_attn);
-  free(x_norm2); free(moe_out);
+  //free(x_norm1); free(attn_out); free(x_after_attn);
+  //free(x_norm2); free(moe_out);
 }

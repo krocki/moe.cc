@@ -34,4 +34,17 @@ typedef struct {
 NpyArray* npy_load_float32(const char* path);
 void npy_free(NpyArray* a);
 
+typedef struct {
+  int    ndim;
+  int*   shape;
+  int32_t* data;
+  size_t nbytes;
+} NpyArrayI32;
+
+NpyArrayI32* npy_load_int32(const char* path);
+void npy_free_i32(NpyArrayI32* a);
+
+void print_progress_bar(size_t done, size_t total);
+void finish_progress_bar(void);
+
 #endif // IO_H
