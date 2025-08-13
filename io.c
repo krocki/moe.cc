@@ -1,32 +1,175 @@
+
 #define _POSIX_C_SOURCE 200809L
 #include "io.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 
-// ---- progress timing state & helpers ----
+// ---- progress state / stats ----
 static struct timespec g_progress_start;
 static int g_progress_started = 0;
-static size_t g_progress_total = 0;
+static size_t g_progress_total_bytes = 0;
+static size_t g_tensor_total = 0;
+static size_t g_tensor_loaded = 0;
 
-static double ts_to_sec(struct timespec t){ return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
+// group stats by (dtype, shape)
+typedef struct {
+  char* key;         // e.g., "f32 [a,b,c]"
+  size_t count;
+  size_t bytes;      // accumulated bytes
+} GroupStat;
+
+static GroupStat* g_groups = NULL;
+static size_t g_groups_n = 0, g_groups_cap = 0;
+
+static size_t g_dtype_counts[4] = {0,0,0,0};
+static size_t g_dtype_bytes[4]  = {0,0,0,0};
+static size_t g_rms_count = 0;
+
+// util
+static const char* dtype_str(int dt){
+  switch(dt){
+    case 0: return "f32";
+    case 1: return "f16";
+    case 2: return "i8";
+    case 3: return "i4";
+    default: return "unk";
+  }
+}
+
 static double now_monotonic(){
-  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return ts_to_sec(t);
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+  return (double)t.tv_sec + (double)t.tv_nsec*1e-9;
 }
 
-// Formats seconds as H:MM:SS into buf
-static void format_hms(double seconds, char* buf, size_t buflen){
-  if (seconds < 0 || !isfinite(seconds)) { snprintf(buf, buflen, "--:--:--"); return; }
-  long s = (long)(seconds + 0.5);
-  long h = s / 3600; s %= 3600;
-  long m = s / 60;   s %= 60;
-  snprintf(buf, buflen, "%ldh:%02ldm:%02lds", h, m, s);
+static int strcasestr_contains(const char* hay, const char* needle){
+  if(!hay || !needle) return 0;
+  for(const char* p = hay; *p; ++p){
+    const char* a=p; const char* b=needle;
+    while(*a && *b){
+      char ca = *a; if(ca>='A' && ca<='Z') ca += 'a'-'A';
+      char cb = *b; if(cb>='A' && cb<='Z') cb += 'a'-'A';
+      if(ca != cb) break;
+      ++a; ++b;
+    }
+    if(!*b) return 1;
+  }
+  return 0;
 }
+
+static char* shape_key(int dtype, int ndim, const int* shape){
+  // build "f32 [a,b,c]" string
+  char buf[256];
+  int off = snprintf(buf, sizeof(buf), "%s [", dtype_str(dtype));
+  for (int i=0;i<ndim;i++){
+    off += snprintf(buf+off, sizeof(buf)-off, "%d%s", shape[i], (i+1<ndim)?",":"]");
+    if (off >= (int)sizeof(buf)-8) break;
+  }
+  char* s = (char*)malloc(off+1);
+  memcpy(s, buf, off+1);
+  return s;
+}
+
+static void add_group_stat(int dtype, int ndim, const int* shape, size_t bytes){
+  char* key = shape_key(dtype, ndim, shape);
+  // find existing
+  for (size_t i=0;i<g_groups_n;i++){
+    if (strcmp(g_groups[i].key, key)==0){
+      g_groups[i].count += 1;
+      g_groups[i].bytes += bytes;
+      free(key);
+      return;
+    }
+  }
+  if (g_groups_n == g_groups_cap){
+    g_groups_cap = g_groups_cap? g_groups_cap*2 : 16;
+    g_groups = (GroupStat*)realloc(g_groups, g_groups_cap*sizeof(GroupStat));
+  }
+  g_groups[g_groups_n].key = key;
+  g_groups[g_groups_n].count = 1;
+  g_groups[g_groups_n].bytes = bytes;
+  g_groups_n++;
+}
+
+// ---- progress tracking and display ----
+static struct timespec g_progress_start = {0,0};
+static int g_progress_multiline_started = 0;
+
+// Progress line
+static void progress_draw(size_t done_bytes, size_t total_bytes, size_t loaded, size_t total_tensors, const char* name){
+    if (!total_bytes) return;
+
+    if (!g_progress_started) {
+        clock_gettime(CLOCK_MONOTONIC, &g_progress_start);
+        g_progress_started = 1;
+    }
+
+    double t_now = now_monotonic();
+    double t_start = g_progress_start.tv_sec + g_progress_start.tv_nsec * 1e-9;
+    double elapsed = t_now - t_start;
+    if (elapsed <= 1e-9) elapsed = 1e-9;
+
+    double done_gib = (double)done_bytes / (1ull<<30);
+    double total_gib = (double)total_bytes / (1ull<<30);
+    double speed = done_gib / elapsed;
+    double rem_bytes = (done_bytes < total_bytes) ? total_bytes - done_bytes : 0;
+    double eta_s = (speed > 1e-12) ? (rem_bytes / (1ull<<30)) / speed : -1;
+
+    int pct = (int)((done_bytes * 100.0) / total_bytes);
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+
+    const int width = 20;
+    char bar[width+1];
+    int filled = (pct * width) / 100;
+    for (int i = 0; i < width; i++) bar[i] = (i < filled ? '#' : '.');
+    bar[width] = '\0';
+
+    char shown[96] = "";
+    if (name && *name) {
+        int maxn = 80;
+        int n = strlen(name);
+        if (n <= maxn) snprintf(shown, sizeof(shown), "%s", name);
+        else snprintf(shown, sizeof(shown), "%.*s…", maxn-1, name);
+    }
+
+    long s = eta_s >= 0 ? (long)(eta_s + 0.5) : -1;
+    long h = (s >= 0) ? (s / 3600) : 0;
+    long m = (s >= 0) ? (s / 60) % 60 : 0;
+    long sec = (s >= 0) ? (s % 60) : 0;
+    char etabuf[16];
+    if (eta_s < 0) snprintf(etabuf, sizeof(etabuf), "--:--:--");
+    else snprintf(etabuf, sizeof(etabuf), "%02ld:%02ld:%02ld", h, m, sec);
+
+    if (g_progress_multiline_started) {
+        fprintf(stderr, "\x1b[1A"); // move up one line
+    } else {
+        g_progress_multiline_started = 1;
+    }
+
+    // Line 1
+    fprintf(stderr, "\x1b[2K\rLoading tensors [%s] (%zu/%zu) %3d%% %.2f GiB/s  (%.2f/%.2f GiB)  ETA %s\n",
+            bar, loaded, total_tensors, pct, speed, done_gib, total_gib, etabuf);
+
+    // Line 2
+    fprintf(stderr, "\x1b[2K\r%s%s ",
+            shown[0] ? "" : "tensor(s) ", shown);
+
+}
+
+static void progress_done(void){
+  if (!g_progress_started){ fputs("\n", stderr); return; }
+  const int width = 20;
+  fputs("\x1b[2K\rLoading tensors [", stderr);
+  for (int i=0;i<width;i++) fputc('#', stderr);
+  fputs("]  100%\n", stderr);
+  fflush(stderr);
+}
+
 
 static uint32_t read_u32(FILE* f){
   uint32_t v;
@@ -45,43 +188,6 @@ static void read_exact(FILE* f, void* buf, size_t n){
 }
 
 // -------- progress bar (in-place, no env var) --------
-static void progress_draw(size_t done, size_t total){
-  if (!total) return;  // nothing to show (e.g., non-regular file)
-
-  if (!g_progress_started){
-    clock_gettime(CLOCK_MONOTONIC, &g_progress_start);
-    g_progress_started = 1;
-    g_progress_total = total;
-  }
-
-  double t_now = now_monotonic();
-  double t_start = ts_to_sec(g_progress_start);
-  double elapsed = t_now - t_start;
-  if (elapsed <= 1e-9) elapsed = 1e-9;
-
-  double done_gb = (double)done / (double)(1<<30);
-  double total_gb = (double)total / (double)(1<<30);
-  double speed_gb_s = done_gb / elapsed;
-  double remaining = (done <= total) ? (double)(total - done) : 0.0;
-  double eta_s = speed_gb_s > 1e-12 ? (remaining / (double)(1<<30)) / speed_gb_s : -1.0;
-  char eta_buf[32]; format_hms(eta_s, eta_buf, sizeof(eta_buf));
-
-  int pct = (int)((done * 100.0) / (double)total);
-  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-  const int width = 40;
-  int fill = (pct * width) / 100;
-
-  fprintf(stderr, "\x1b[2K\rLoading tensors [");
-  for (int i = 0; i < width; ++i) fputc(i < fill ? '#' : '.', stderr);
-  fprintf(stderr, "] %3d%%  %.1f GiB/s  (%.1f/%.1f GiB)  ETA %s",
-          pct, speed_gb_s, done_gb, total_gb, eta_buf);
-  fflush(stderr);
-}
-
-static void progress_done(void){
-  fprintf(stderr, "\x1b[2K\rLoading tensors [########################################] 100%%\n");
-  fflush(stderr);
-}
 
 // -------- .bin loader (export.py format) --------
 BinFile* bin_load(const char* path){
@@ -104,15 +210,15 @@ BinFile* bin_load(const char* path){
   }
 
   uint32_t nt = read_u32(f);
+  g_tensor_total = nt; g_tensor_loaded = 0;
   BinFile* bf = (BinFile*)xmalloc(sizeof(BinFile));
   bf->count = (int)nt;
   bf->arr   = (TensorBin*)xmalloc(sizeof(TensorBin)*nt);
 
   // initial progress snapshot (after header)
-  double t_start = now_monotonic();
   if (total_bytes){
     size_t done = (size_t)ftell(f);
-    progress_draw(done, total_bytes);
+    progress_draw(done, total_bytes, g_tensor_loaded, g_tensor_total, "");
   }
 
   for (uint32_t i=0;i<nt;i++){
@@ -146,20 +252,51 @@ BinFile* bin_load(const char* path){
     t->data   = xmalloc(t->nbytes);
     read_exact(f, t->data, t->nbytes);
 
-    if (total_bytes){
+    // stats
+    g_tensor_loaded++;
+    if (t->dtype>=0 && t->dtype<4){ g_dtype_counts[t->dtype]++; g_dtype_bytes[t->dtype]+=t->nbytes; }
+    add_group_stat(t->dtype, t->ndim, t->shape, t->nbytes);
+    if (strcasestr_contains(t->name, "rms")) g_rms_count++;
+
+if (total_bytes){
       size_t done = (size_t)ftell(f);
-      progress_draw(done, total_bytes);
+      progress_draw(done, total_bytes, g_tensor_loaded, g_tensor_total, t->name);
     }
   }
   fclose(f);
   if (total_bytes) progress_done();
-  double t_now = now_monotonic();
-  double elapsed = t_now - t_start;
-  double total_gb = (double)total_bytes / (double)(1<<30);
-  double speed_gb_s = total_gb / elapsed;
-  fprintf(stderr, "%.1f GiB loaded in  %.2f s (%.1f GiB)\n",
-          total_gb, elapsed, speed_gb_s);
-  return bf;
+// timing summary
+double t_end = now_monotonic();
+double t_start = (double)g_progress_start.tv_sec + (double)g_progress_start.tv_nsec*1e-9;
+double elapsed = (g_progress_started? (t_end - t_start) : 0.0);
+double total_gib = (double)total_bytes / (double)(1ull<<30);
+double speed_gib_s = (elapsed>0)? (total_gib/elapsed) : 0.0;
+fprintf(stderr, "Loaded %.3f GiB in %.2f s (%.3f GiB/s)\n", total_gib, elapsed, speed_gib_s);
+
+// tensor stats
+fprintf(stderr, "Tensors loaded: %zu\n", g_tensor_loaded);
+// by dtype
+const char* dnames[4] = {"f32","f16","i8","i4"};
+for (int d=0; d<4; ++d){
+  if (g_dtype_counts[d]){
+    double gib = (double)g_dtype_bytes[d] / (double)(1ull<<30);
+    fprintf(stderr, "  %-3s: %zu tensors, %.3f GiB\n", dnames[d], g_dtype_counts[d], gib);
+  }
+}
+// top groups (by (dtype,shape))
+size_t shown = 0;
+for (size_t i=0; i<g_groups_n && i<50; ++i){ // show up to 50 lines max
+  double gib = (double)g_groups[i].bytes / (double)(1ull<<30);
+  fprintf(stderr, "  %s : %zu tensors, %.3f GiB\n", g_groups[i].key, g_groups[i].count, gib);
+  shown++;
+}
+if (g_rms_count){
+  fprintf(stderr, "  rms/rmsnorm tensors: %zu\n", g_rms_count);
+}
+// cleanup group keys
+for (size_t i=0;i<g_groups_n;i++) free(g_groups[i].key);
+free(g_groups); g_groups=NULL; g_groups_n=g_groups_cap=0;
+return bf;
 }
 
 void bin_free(BinFile* bf){
@@ -284,7 +421,7 @@ void npy_free_i32(NpyArrayI32* a){
 
 /* ---------- progress bar (same style as test_model.c) ---------- */
 void print_progress_bar(size_t done, size_t total){
-  const int width = 40;
+  const int width = 20;
   int filled = (total == 0) ? width : (int)((done * width) / total);
   if (filled < 0) filled = 0; if (filled > width) filled = width;
   fputs("\rLoading tensors [", stderr);
@@ -298,3 +435,4 @@ void print_progress_bar(size_t done, size_t total){
 void finish_progress_bar(void){
   fputs("\n", stderr);
 }
+

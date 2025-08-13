@@ -10,36 +10,47 @@ def infer_head_dim(Dq, Dkv):
   return g if g > 0 else Dq
 
 @torch.no_grad()
-def apply_qk_norm(Q, K, qn, kn, n_q, n_kv, head_dim):
-  T = Q.shape[0]
-  Dq, Dkv = Q.shape[1], K.shape[1]
-  if qn is not None:
-    if qn.numel() == n_q:
-      Q = Q.view(T, n_q, head_dim) * qn.view(1, n_q, 1)
-      Q = Q.view(T, Dq)
-    elif qn.numel() == Dq:
-      Q = Q * qn
-  if kn is not None:
-    if kn.numel() == n_kv:
-      K = K.view(T, n_kv, head_dim) * kn.view(1, n_kv, 1)
-      K = K.view(T, Dkv)
-    elif kn.numel() == Dkv:
-      K = K * kn
-  return Q, K
+def apply_qk_rmsnorm(Q, K, qn, kn, n_q, n_kv, head_dim, eps=1e-6):
+    """
+    Per-head RMSNorm with epsilon, then apply learned scales.
+    Supports three layouts for qn/kn: [head_dim], [#heads], or [#heads*head_dim].
+    """
+    def _one(Tmat, H, scale):
+        # reshape to [T, H, D]
+        T, Dtot = Tmat.shape
+        x = Tmat.view(T, H, head_dim).float()
+        # RMS over last dim
+        msq = (x * x).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(msq + eps)
+        if scale is not None:
+            s = scale.float()
+            if s.numel() == head_dim:
+                x = x * s.view(1, 1, head_dim)
+            elif s.numel() == H:
+                x = x * s.view(1, H, 1)
+            elif s.numel() == H * head_dim:
+                x = x * s.view(1, H, head_dim)
+            else:
+                raise ValueError(f"Unexpected scale len {s.numel()} for H={H}, D={head_dim}")
+        return x.view(T, H * head_dim).to(Tmat.dtype)
+
+    Q = _one(Q, n_q,  qn)
+    K = _one(K, n_kv, kn)
+    return Q, K
 
 @torch.no_grad()
 def rope_apply_torch_gqa(Q, K, n_q, n_kv, head_dim, pos0, theta):
   T = Q.shape[0]
-  i = torch.arange(0, head_dim, 2, dtype=Q.dtype)
-  base = theta ** (-i / head_dim)  # [D/2]
-  p = torch.arange(pos0, pos0 + T, dtype=Q.dtype).unsqueeze(1)  # [T,1]
-  ang = p * base  # [T,D/2]
+  i = torch.arange(0, head_dim, 2, dtype=Q.dtype, device=Q.device)
+  base = theta ** (-i / head_dim)           # [D/2]
+  p = torch.arange(pos0, pos0 + T, dtype=Q.dtype, device=Q.device).unsqueeze(1)  # [T,1]
+  ang = p * base                            # [T,D/2]
   c = torch.cos(ang).unsqueeze(-1)
   s = torch.sin(ang).unsqueeze(-1)
 
-  def apply(x, n_heads):
-    x = x.view(T, n_heads, head_dim)
-    xe = x[:, :, 0::2].transpose(1,2)  # [T,D/2,H]
+  def apply(x, H):
+    x = x.view(T, H, head_dim)
+    xe = x[:, :, 0::2].transpose(1,2)       # [T,D/2,H]
     xo = x[:, :, 1::2].transpose(1,2)
     xe2 =  xe * c - xo * s
     xo2 =  xo * c + xe * s
@@ -48,7 +59,7 @@ def rope_apply_torch_gqa(Q, K, n_q, n_kv, head_dim, pos0, theta):
     y = torch.empty_like(x)
     y[:, :, 0::2] = xe2
     y[:, :, 1::2] = xo2
-    return y.view(T, n_heads * head_dim)
+    return y.view(T, H * head_dim)
 
   return apply(Q, n_q), apply(K, n_kv)
 
@@ -60,12 +71,13 @@ def attn_forward_torch_gqa_with_rope(x, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, causa
   n_q = Dq // head_dim
   n_kv = Dkv // head_dim
   scale = (1.0 / (head_dim ** 0.5))
+
   def proj(x,W,b): y = x @ W.t();  return y + b if b is not None else y
 
   Q = proj(x,Wq,bq); K = proj(x,Wk,bk); V = proj(x,Wv,bv)
-  Q, K = apply_qk_norm(Q, K, qn, kn, n_q, n_kv, head_dim)
+  Q, K = apply_qk_rmsnorm(Q, K, qn, kn, n_q, n_kv, head_dim)  # <- was apply_qk_norm(...)
   if rope:
-    Q, K = rope_apply_torch_gqa(Q, K, n_q, n_kv, head_dim, pos0=0, theta=rope_theta)
+      Q, K = rope_apply_torch_gqa(Q, K, n_q, n_kv, head_dim, pos0=0, theta=rope_theta)
 
   Hcat = torch.zeros(T, Dq, dtype=x.dtype)
   Qh = Q.view(T, n_q, head_dim)
@@ -73,15 +85,12 @@ def attn_forward_torch_gqa_with_rope(x, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, causa
   Vh = V.view(T, n_kv, head_dim)
   for h in range(n_q):
     kvh = h % n_kv
-    qh = Qh[:, h, :]
-    kh = Kh[:, kvh, :]
-    vh = Vh[:, kvh, :]
-    S = (qh @ kh.t()) * scale
+    S = (Qh[:,h,:] @ Kh[:,kvh,:].t()) * scale
     if causal:
-      mask = torch.triu(torch.ones(T,T, dtype=torch.bool), diagonal=1)
-      S.masked_fill_(mask, float('-inf'))
+      mask = torch.triu(torch.ones(T,T, dtype=torch.bool, device=S.device), diagonal=1)
+      S = S.masked_fill(mask, float('-inf'))
     P = torch.softmax(S, dim=-1)
-    Hcat[:, h*head_dim:(h+1)*head_dim] = P @ vh
+    Hcat[:, h*head_dim:(h+1)*head_dim] = P @ Vh[:,kvh,:]
 
   y = Hcat @ Wo.t()
   if bo is not None: y = y + bo
@@ -101,8 +110,7 @@ def main():
 
   torch.manual_seed(args.seed); np.random.seed(args.seed)
   model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="cpu")
-  sd = model.state_dict()
-  L = args.layer
+  sd = model.state_dict(); L = args.layer
 
   Wq = sd[f"model.layers.{L}.self_attn.q_proj.weight"].float()
   Wk = sd[f"model.layers.{L}.self_attn.k_proj.weight"].float()
@@ -125,7 +133,8 @@ def main():
   np.save(args.outbase + ".x.npy", x.numpy().astype(np.float32))
   np.save(args.outbase + ".y.npy", y.numpy().astype(np.float32))
 
-  print("Suggested export:")
+  print(f"Saved {args.outbase}.x.npy and {args.outbase}.y.npy (T={args.seqlen}, D={d_model})")
+  print("Export:")
   print(f"  python export.py --model {args.model} --out l{L}_attn.bin --layer {L} --part attn --quant none")
 
 if __name__ == "__main__":

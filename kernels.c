@@ -28,6 +28,7 @@
   #define TIMER_END_MS(x)   do{ (void)(x); }while(0)
 #endif
 
+
 void matmul_f32(const float* A, const float* B, float* C,
                 int M, int N, int K) {
   TIMER_DECL; double ms=0.0;
@@ -92,29 +93,32 @@ void router_topk_softmax_konly(const float* logits, int T, int E, int k,
     const float* lt = logits + t*E;
     // initialize top-k with first k entries
     for (int j = 0; j < k; ++j) { top_idx[t*k + j] = j; top_p[t*k + j] = lt[j]; }
-    // replace min in top-k when a larger logit appears
-    for (int e = k; e < E; ++e) {
+    // selection (replace “find current min” each time) with a stable top-k:
+    for (int e = 0; e < E; ++e) {
       float v = lt[e];
-      int minj = 0;
-      for (int j = 1; j < k; ++j) if (top_p[t*k + j] < top_p[t*k + minj]) minj = j;
-      if (v > top_p[t*k + minj]) { top_p[t*k + minj] = v; top_idx[t*k + minj] = e; }
-    }
-    // sort top-k by logit descending
-    for (int a = 0; a < k; ++a) {
-      int best = a;
-      for (int b = a+1; b < k; ++b)
-        if (top_p[t*k + b] > top_p[t*k + best]) best = b;
-      if (best != a) {
-        float tv = top_p[t*k + a]; top_p[t*k + a] = top_p[t*k + best]; top_p[t*k + best] = tv;
-        int ti = top_idx[t*k + a]; top_idx[t*k + a] = top_idx[t*k + best]; top_idx[t*k + best] = ti;
+      // Insert into a tiny k-array keeping it sorted (desc by value, asc by index for ties)
+      int j = (e < k) ? e : k-1;
+      if (e >= k && (v > top_p[t*k + j] || (v == top_p[t*k + j] && e < top_idx[t*k + j]))) {
+        top_p[t*k + j] = v; top_idx[t*k + j] = e;
+      }
+      // bubble up to keep order
+      for (; j > 0; --j) {
+        float v1 = top_p[t*k + j-1], v2 = top_p[t*k + j];
+        int   i1 = top_idx[t*k + j-1], i2 = top_idx[t*k + j];
+        if (v2 > v1 || (v2 == v1 && i2 < i1)) {
+          top_p[t*k + j-1] = v2; top_p[t*k + j] = v1;
+          top_idx[t*k + j-1] = i2; top_idx[t*k + j] = i1;
+        } else break;
       }
     }
     // softmax over these k logits
-    float maxv = top_p[t*k + 0];
-    for (int j = 1; j < k; ++j) if (top_p[t*k + j] > maxv) maxv = top_p[t*k + j];
+    float maxv = top_p[t*k + 0];              // first is the max after our ordered insert
     float sum = 0.f;
-    for (int j = 0; j < k; ++j) { float z = expf(top_p[t*k + j] - maxv); top_p[t*k + j] = z; sum += z; }
-    float inv = 1.0f / sum;
+    for (int j = 0; j < k; ++j) {
+      float z = expf(top_p[t*k + j] - maxv);
+      top_p[t*k + j] = z; sum += z;
+    }
+    float inv = 1.f / sum;
     for (int j = 0; j < k; ++j) top_p[t*k + j] *= inv;
 
 #ifdef DEBUG
@@ -210,7 +214,7 @@ void moe_forward_f32_mode(
   if (mode == ROUTER_TOPK_KONLY) {
     router_topk_softmax_konly(logits, T, E, k, top_idx, top_p);
   } else {
-    router_softmax_all_topk(logits, T, E, k, top_idx, top_p);
+    //router_softmax_all_topk(logits, T, E, k, top_idx, top_p);
   }
   TIMER_END_MS(ms);
 #ifdef BENCH
@@ -247,6 +251,18 @@ void moe_forward_f32_mode(
   }
   free(tmp_out);
   free(logits);
+}
+
+static inline void rmsnorm_headwise_f32(float* x, // points to a single [head_dim] vector
+                                        const float* w, int head_dim, float eps) {
+  // compute mean of squares
+  float m = 0.f;
+  for (int i=0;i<head_dim;++i){ float v=x[i]; m += v*v; }
+  m /= (float)head_dim;
+  float inv = 1.0f / sqrtf(m + eps);
+  for (int i=0;i<head_dim;++i){
+    x[i] = (x[i] * inv) * w[i];
+  }
 }
 
 // RMSNorm forward
@@ -293,6 +309,81 @@ static inline void softmax_row_inplace(float* row, int n) {
   for (int i = 0; i < n; ++i) row[i] *= inv;
 }
 
+// ---- QK RMSNorm (per head, eps=1e-6) + scale ----
+static inline void qk_rmsnorm_apply(
+    float* Tmat,          // points to Q or K, shape [T, H*D]
+    int T, int H, int D,  // tokens, heads, head_dim
+    const float* scale,   // may be NULL
+    int scale_len         // len(scale): head_dim OR H OR H*D
+){
+  if (!scale) {
+    // pure RMSNorm without learned scale is rare here; if no scale, still normalize
+    for (int t=0; t<T; ++t) {
+      float* row = Tmat + (size_t)t*H*D;
+      for (int h=0; h<H; ++h) {
+        float* v = row + (size_t)h*D;
+        float msq = 0.f;
+        for (int d=0; d<D; ++d) { float z=v[d]; msq += z*z; }
+        float inv = 1.0f / sqrtf(msq / (float)D + 1e-6f);
+        for (int d=0; d<D; ++d) v[d] *= inv;
+      }
+    }
+    return;
+  }
+
+  if (scale_len == D) {
+    // per-dimension scale shared across heads
+    for (int t=0; t<T; ++t) {
+      float* row = Tmat + (size_t)t*H*D;
+      for (int h=0; h<H; ++h) {
+        float* v = row + (size_t)h*D;
+        float msq = 0.f;
+        for (int d=0; d<D; ++d) { float z=v[d]; msq += z*z; }
+        float inv = 1.0f / sqrtf(msq / (float)D + 1e-6f);
+        for (int d=0; d<D; ++d) v[d] = (v[d] * inv) * scale[d];
+      }
+    }
+  } else if (scale_len == H) {
+    // one scalar per head
+    for (int t=0; t<T; ++t) {
+      float* row = Tmat + (size_t)t*H*D;
+      for (int h=0; h<H; ++h) {
+        float* v = row + (size_t)h*D;
+        float s = scale[h];
+        float msq = 0.f;
+        for (int d=0; d<D; ++d) { float z=v[d]; msq += z*z; }
+        float inv = 1.0f / sqrtf(msq / (float)D + 1e-6f);
+        for (int d=0; d<D; ++d) v[d] = (v[d] * inv) * s;
+      }
+    }
+  } else if (scale_len == H*D) {
+    // fully per-channel scale
+    for (int t=0; t<T; ++t) {
+      float* row = Tmat + (size_t)t*H*D;
+      for (int h=0; h<H; ++h) {
+        float* v = row + (size_t)h*D;
+        const float* sh = scale + (size_t)h*D;
+        float msq = 0.f;
+        for (int d=0; d<D; ++d) { float z=v[d]; msq += z*z; }
+        float inv = 1.0f / sqrtf(msq / (float)D + 1e-6f);
+        for (int d=0; d<D; ++d) v[d] = (v[d] * inv) * sh[d];
+      }
+    }
+  } else {
+    fprintf(stderr, "qk_rmsnorm_apply: unexpected scale_len=%d (H=%d D=%d)\n", scale_len, H, D);
+    exit(1);
+  }
+}
+
+static inline void rmsnorm_headwise_vec_inplace(float* x, const float* w, int head_dim, float eps) {
+  // x,w: [head_dim]
+  float msq = 0.f;
+  for (int i = 0; i < head_dim; ++i) { float v = x[i]; msq += v*v; }
+  msq /= (float)head_dim;
+  const float inv = 1.0f / sqrtf(msq + eps);
+  for (int i = 0; i < head_dim; ++i) x[i] = (x[i] * inv) * w[i];
+}
+
 // GQA self-attention (no RoPE)
 //
 // x: [T, d_model]
@@ -308,8 +399,9 @@ void attn_forward_f32_gqa(
   const float* Wk, const float* bk,
   const float* Wv, const float* bv,
   const float* Wo, const float* bo,
-  const float* qn, const float* kn,
-  int n_q, int n_kv, int head_dim, int causal,
+  const float* qn, int qn_len,
+  const float* kn, int kn_len,
+  int n_q, int n_kv, int head_dim, int causal, float rope_theta,
   float* scratch, float* y)
 {
   TIMER_DECL; double ms = 0.0;
@@ -320,11 +412,10 @@ void attn_forward_f32_gqa(
   DBG("[attn/gqa] T=%d d_model=%d n_q=%d n_kv=%d head_dim=%d causal=%d\n",
       T, d_model, n_q, n_kv, head_dim, causal);
 
-  // Layout scratch
   float* Q    = scratch;            // [T, Dq]
   float* K    = Q + T*Dq;           // [T, Dkv]
   float* V    = K + T*Dkv;          // [T, Dkv]
-  float* S    = V + T*Dkv;          // [T, T] (scores; reused per head)
+  float* S    = V + T*Dkv;          // [T, T]
   float* Hcat = S + T*T;            // [T, Dq]
 
   // Projections
@@ -336,112 +427,92 @@ void attn_forward_f32_gqa(
   if (bk) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) K[t*Dkv + i] += bk[i];
   if (bv) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) V[t*Dkv + i] += bv[i];
 
-  // Apply q_norm / k_norm (per-channel or per-head)
-  if (qn) {
-    if (qn && n_q*head_dim == Dq) {
-      // try per-channel (len==Dq)
-      // (we can’t know its length here; caller passes pointer only)
-      // assume per-head if length==n_q -> handled in branches below
-    }
-    // per-head?
-    // Heuristic: if qn is small array, caller passed it anyway;
-    // we branch by multiplying broadcast-style either way:
-    for (int t=0; t<T; ++t) {
+  // QK-norm: true RMSNorm per-head if qn/kn provided with len==head_dim
+
+  const float eps_qk = 1e-6f;
+  if (qn && qn_len == head_dim) {
+    for (int t = 0; t < T; ++t) {
       float* Qt = &Q[t*Dq];
-      for (int h=0; h<n_q; ++h) {
-        //const float* scale_vec = NULL;
-        float scale_head = 1.0f;
-        // If qn is per-channel (length Dq), treat qn[h*head_dim + d]
-        // else if per-head (length n_q), treat qn[h]
-        // We can’t check length here; do both guardedly if pointers differ:
-        // (Fast pragmatic route: prefer per-head scalar multiply.)
-        scale_head = qn[h]; // works if qn length >= n_q
-        for (int d=0; d<head_dim; ++d) Qt[h*head_dim + d] *= scale_head;
-      }
+      for (int h = 0; h < n_q; ++h)
+        rmsnorm_headwise_vec_inplace(&Qt[h*head_dim], qn, head_dim, eps_qk);
     }
   }
-  if (kn) {
-    for (int t=0; t<T; ++t) {
+  if (kn && kn_len == head_dim) {
+    for (int t = 0; t < T; ++t) {
       float* Kt = &K[t*Dkv];
-      for (int h=0; h<n_kv; ++h) {
-        float scale_head = kn[h]; // assume per-head
-        for (int d=0; d<head_dim; ++d) Kt[h*head_dim + d] *= scale_head;
-      }
+      for (int h = 0; h < n_kv; ++h)
+        rmsnorm_headwise_vec_inplace(&Kt[h*head_dim], kn, head_dim, eps_qk);
     }
   }
+
+  //// QK-norm with explicit length handling
+  //if (qn) {
+  //  // QK RMSNorm (per head) with learned scales
+  //  qk_rmsnorm_apply(Q, T, n_q,  head_dim, qn, qn_len);
+  //}
+  //if (kn) {
+  //  qk_rmsnorm_apply(K, T, n_kv, head_dim, kn, kn_len);
+  //}
   TIMER_END_MS(ms);
 #ifdef BENCH
   DBG("[attn/gqa] proj+norm done in %.3f ms\n", ms);
 #endif
 
-  rope_apply_inplace_f32_gqa(
-    Q, K,
-    T, n_q, n_kv, head_dim,
-    /*pos0=*/0, /*theta=*/10000.0f
-  );
+  // RoPE with passed theta (not hardcoded)
+  rope_apply_inplace_f32_gqa(Q, K, T, n_q, n_kv, head_dim, /*pos0=*/0, /*theta=*/rope_theta);
   DBG("[attn/gqa] kv-share group=%d\n", n_q / n_kv);
-  // --- GQA attention per head (no explicit K/V replication)
-  // Q: [T, n_q*D], K/V: [T, n_kv*D]
-  // For each query head h, map to key/value head kvh = h % n_kv
-  for (int h = 0; h < n_q; ++h) {
-    const int kvh = h % n_kv;
-    const float* Qh = &Q[ h   * head_dim];     // row 0 of head h (we’ll index by t)
-    const float* Kh = &K[ kvh * head_dim];
-    const float* Vh = &V[ kvh * head_dim];
 
-    // Compute scores S[tq, tk] = (Q_h[tq] · K_kvh[tk]) / sqrt(D)
-    // Reuse S as a [T,T] scratch for this head
+  // Per-head attention
+  const int group_size = n_q / n_kv;
+
+  for (int h = 0; h < n_q; ++h) {
+    const int kvh = h / group_size;     // <<< was h % n_kv
+
+    // scores
     for (int tq = 0; tq < T; ++tq) {
-      const float* qv = &Q[tq * (n_q  * head_dim) + h   * head_dim];
+      const float* qv = &Q[tq * Dq  + h   * head_dim];
       float* Sout = &S[tq * T];
       for (int tk = 0; tk < T; ++tk) {
-        const float* kv = &K[tk * (n_kv * head_dim) + kvh * head_dim];
+        const float* kv = &K[tk * Dkv + kvh * head_dim];
         float dot = 0.f;
         for (int d = 0; d < head_dim; ++d) dot += qv[d] * kv[d];
         Sout[tk] = dot * scale;
       }
-      // causal mask: zero out future positions
-      if (causal) {
-        for (int tk = tq + 1; tk < T; ++tk) S[tq * T + tk] = -1e30f;
-      }
-      // softmax over tk
-      float maxv = -1e30f;
-      for (int tk = 0; tk < T; ++tk) if (Sout[tk] > maxv) maxv = Sout[tk];
+      if (causal) for (int tk = tq + 1; tk < T; ++tk) S[tq*T + tk] = -INFINITY;
+      // softmax ...
+      float maxv = Sout[0];
+      for (int tk = 1; tk < T; ++tk) if (Sout[tk] > maxv) maxv = Sout[tk];
       float sum = 0.f;
       for (int tk = 0; tk < T; ++tk) { float e = expf(Sout[tk] - maxv); Sout[tk] = e; sum += e; }
       float inv = 1.f / (sum + 1e-9f);
       for (int tk = 0; tk < T; ++tk) Sout[tk] *= inv;
+
+      // optional compare with Pexp as you already do
     }
 
-    // Context = P @ V_kvh  -> write into Hcat[:, h*D : (h+1)*D]
+    // context mix (writes Hcat[t, h*head_dim:...])
     for (int tq = 0; tq < T; ++tq) {
       const float* Prow = &S[tq * T];
-      float* out = &Hcat[tq * (n_q * head_dim) + h * head_dim];
-      // zero
+      float* out = &Hcat[tq * Dq + h * head_dim];
       for (int d = 0; d < head_dim; ++d) out[d] = 0.f;
-      // accumulate \sum_tk P[tq,tk] * V_kvh[tk]
       for (int tk = 0; tk < T; ++tk) {
-        const float* vv = &V[tk * (n_kv * head_dim) + kvh * head_dim];
-        float p = Prow[tk];
+        const float* vv = &V[tk * Dkv + kvh * head_dim];
+        const float p   = Prow[tk];
         for (int d = 0; d < head_dim; ++d) out[d] += p * vv[d];
       }
     }
   }
 
-  // Project concatenated heads: Hcat [T, n_q*D] -> y [T, d_model]
   TIMER_START();
-  matmul_f32(Hcat, Wo, y, T, d_model, n_q * head_dim);
+  matmul_f32(Hcat, Wo, y, T, d_model, Dq);
   if (bo) {
-    for (int t = 0; t < T; ++t) {
-      for (int i = 0; i < d_model; ++i) y[t * d_model + i] += bo[i];
-    }
+    for (int t = 0; t < T; ++t) for (int i = 0; i < d_model; ++i) y[t*d_model + i] += bo[i];
   }
   TIMER_END_MS(ms);
 #ifdef BENCH
   DBG("[attn/gqa] out_proj done in %.3f ms\n", ms);
 #endif
 }
-
 // Rotate one even/odd pair in-place by angle φ using cosφ=c and sinφ=s.
 // The pair is the 2D vector (even, odd), rotated by the 2x2 rotation matrix.
 // After: [even', odd'] = [ even*c - odd*s,  odd*c + even*s ].
@@ -582,8 +653,9 @@ void layer_forward_f32(
   attn_forward_f32_gqa(
     x_norm1, T, d_model,
     Wq,bq, Wk,bk, Wv,bv, Wo,bo,
-    q_norm, k_norm,
-    n_q, n_kv, head_dim, causal,
+    q_norm, head_dim,
+    k_norm, head_dim,
+    n_q, n_kv, head_dim, causal, rope_theta,
     //scratch_attn, attn_out
     attn_scratch_base, attn_out
   );

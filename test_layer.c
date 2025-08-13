@@ -19,6 +19,11 @@ static const float* opt(BinFile* bf, const char* k) {
   return t ? (const float*)t->data : NULL;
 }
 
+static const float* opt_f32(BinFile* bf, const char* k) {
+  TensorBin* t = bin_find(bf, k);
+  return (t && t->dtype == 0) ? (const float*)t->data : NULL; // 0=f32 in your loader
+}
+
 int main(int argc, char** argv){
   if (argc < 5){
     fprintf(stderr, "Usage: %s <weights.bin> <x.npy> <y.npy> <rope_theta>\n", argv[0]);
@@ -39,10 +44,10 @@ int main(int argc, char** argv){
   const float* Wv = must(bf, "model.layers.0.self_attn.v_proj.weight");
   const float* Wo = must(bf, "model.layers.0.self_attn.o_proj.weight");
 
-  const float* bq = opt(bf, "model.layers.0.self_attn.q_proj.bias");
-  const float* bk = opt(bf, "model.layers.0.self_attn.k_proj.bias");
-  const float* bv = opt(bf, "model.layers.0.self_attn.v_proj.bias");
-  const float* bo = opt(bf, "model.layers.0.self_attn.o_proj.bias");
+  const float* bq = opt_f32(bf, "model.layers.0.self_attn.q_proj.bias");
+  const float* bk = opt_f32(bf, "model.layers.0.self_attn.k_proj.bias");
+  const float* bv = opt_f32(bf, "model.layers.0.self_attn.v_proj.bias");
+  const float* bo = opt_f32(bf, "model.layers.0.self_attn.o_proj.bias");
 
   const float* qn = must(bf, "model.layers.0.self_attn.q_norm.weight");
   const float* kn = must(bf, "model.layers.0.self_attn.k_norm.weight");
@@ -59,7 +64,9 @@ int main(int argc, char** argv){
   const float* w2 = must(bf, "model.layers.0.post_attention_layernorm.weight");
 
   const float* router_w = must(bf, "model.layers.0.mlp.gate.weight");
-  const float* router_b = opt (bf, "model.layers.0.mlp.gate.bias");
+  const float* router_b = opt_f32(bf, "model.layers.0.mlp.gate.bias");
+  if (!router_b) router_b = opt_f32(bf, "model.layers.0.mlp.router.gate.bias");
+
 
   // Collect expert weights (E,d_ff inferred by scanning down_proj)
   int E = 0, d_ff = 0;
@@ -90,6 +97,11 @@ int main(int argc, char** argv){
     if ((t=bin_find(bf,k1b))) bg[e] = (const float*)t->data;
     if ((t=bin_find(bf,k2b))) bu[e] = (const float*)t->data;
     if ((t=bin_find(bf,k3b))) bd[e] = (const float*)t->data;
+
+    bg[e] = opt_f32(bf, k1b);
+    bu[e] = opt_f32(bf, k2b);
+    bd[e] = opt_f32(bf, k3b);
+
   }
 
   NpyArray* nx = npy_load_float32(xfile);

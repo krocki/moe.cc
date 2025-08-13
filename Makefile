@@ -1,10 +1,10 @@
 # Makefile (tab-indented rules)
 CC = gcc
-CFLAGS = -g -O2 -Wall -DDEBUG -DBENCH
+CFLAGS = -g -O1 -Wall #-DDEBUG -DBENCH
 
 OBJS = io.o utils.o kernels.o
 
-all: test_embed test_head test_stack test_expert test_moe_block test_rmsnorm test_attn test_rope test_layer test_model test-model-v0 list_bin
+all: test_embed test_head test_layer_trace test_model_trace test_expert test_moe_block test_rmsnorm test_attn test_rope test_layer test_model test-model-v0 list_bin
 
 test_expert: test_expert.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -37,6 +37,12 @@ test-model-v0: test-model-v0.o io.o utils.o kernels.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 test_model: test_model.o io.o utils.o kernels.o model.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+test_layer_trace: test_layer_trace.o io.o utils.o kernels.o model.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+test_model_trace: test_model_trace.o io.o utils.o kernels.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 list_bin: list_bin.o io.o

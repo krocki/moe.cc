@@ -2,15 +2,136 @@
 import argparse, numpy as np, torch
 from transformers import AutoModelForCausalLM
 
+# ---------------- helpers (kept consistent with your C stack) ----------------
+
+def infer_head_dim(Dq, Dkv):
+  for d in [128, 96, 80, 64, 48, 40, 32]:
+    if Dq % d == 0 and Dkv % d == 0:
+      return d
+  from math import gcd
+  g = gcd(Dq, Dkv)
+  return g if g > 0 else Dq
+
 @torch.no_grad()
-def run_first_n_layers(model, x, n_layers, theta=10000.0, causal=True):
-  """Match your stack path: RMS-ATTN-RMS-MoE per layer; returns hidden after N layers."""
+def rmsnorm(x, w, eps):
+  # x: [T, D], w: [D]
+  var = (x * x).mean(dim=-1, keepdim=True)
+  xhat = x * torch.rsqrt(var + eps)
+  return xhat * w
+
+@torch.no_grad()
+def proj(x, W, b):  # x @ W^T + b
+  y = x @ W.t()
+  return y + b if b is not None else y
+
+@torch.no_grad()
+def apply_qk_norm(Q, K, qn, kn, n_q, n_kv, head_dim, mode="auto"):
+  """mode: 'auto' -> apply if weights exist; 'on' -> require & apply; 'off' -> skip"""
+  if mode == "off":
+    return Q, K
+  T = Q.shape[0]; Dq, Dkv = Q.shape[1], K.shape[1]
+  if qn is not None:
+    if qn.numel() == n_q:
+      Q = Q.view(T,n_q,head_dim) * qn.view(1,n_q,1); Q = Q.view(T,Dq)
+    elif qn.numel() == Dq:
+      Q = Q * qn
+  elif mode == "on":
+    raise RuntimeError("QK-norm is 'on' but q_norm is missing")
+  if kn is not None:
+    if kn.numel() == n_kv:
+      K = K.view(T,n_kv,head_dim) * kn.view(1,n_kv,1); K = K.view(T,Dkv)
+    elif kn.numel() == Dkv:
+      K = K * kn
+  elif mode == "on":
+    raise RuntimeError("QK-norm is 'on' but k_norm is missing")
+  return Q, K
+
+@torch.no_grad()
+def rope(Q, K, n_q, n_kv, head_dim, pos0, theta):
+  # Q,K: [T, n_heads*head_dim]
+  T = Q.shape[0]
+  i = torch.arange(0, head_dim, 2, dtype=Q.dtype)
+  base = theta ** (-i / head_dim)
+  p = torch.arange(pos0, pos0 + T, dtype=Q.dtype).unsqueeze(1)
+  ang = p * base
+  c = torch.cos(ang).unsqueeze(-1)
+  s = torch.sin(ang).unsqueeze(-1)
+
+  def apply(x, H):
+    x = x.view(T,H,head_dim)
+    xe = x[:,:,0::2].transpose(1,2)   # [T, head_dim/2, H]
+    xo = x[:,:,1::2].transpose(1,2)
+    xe2 =  xe * c - xo * s
+    xo2 =  xo * c + xe * s
+    xe2 = xe2.transpose(1,2)
+    xo2 = xo2.transpose(1,2)
+    y = torch.empty_like(x)
+    y[:,:,0::2] = xe2; y[:,:,1::2] = xo2
+    return y.view(T, H*head_dim)
+
+  return apply(Q, n_q), apply(K, n_kv)
+
+@torch.no_grad()
+def attn_gqa_block(x, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, qkn_mode, causal, theta):
+  T, D = x.shape
+  Dq, Dkv = Wq.shape[0], Wk.shape[0]
+  d = infer_head_dim(Dq, Dkv)
+  n_q = Dq // d; n_kv = Dkv // d
+  Q = proj(x,Wq,bq); K = proj(x,Wk,bk); V = proj(x,Wv,bv)
+  Q,K = apply_qk_norm(Q,K,qn,kn,n_q,n_kv,d, mode=qkn_mode)
+  Q,K = rope(Q,K,n_q,n_kv,d, pos0=0, theta=theta)
+
+  scale = 1.0 / (d**0.5)
+  Hcat = torch.zeros(T, Dq, dtype=x.dtype)
+  Qh = Q.view(T,n_q,d); Kh = K.view(T,n_kv,d); Vh = V.view(T,n_kv,d)
+
+  for h in range(n_q):
+    kvh = h % n_kv
+    S = (Qh[:,h,:] @ Kh[:,kvh,:].t()) * scale  # [T,T]
+    if causal:
+      mask = torch.triu(torch.ones(T,T, dtype=torch.bool), diagonal=1)
+      S.masked_fill_(mask, float('-inf'))
+    P = torch.softmax(S, dim=-1)
+    Hcat[:, h*d:(h+1)*d] = P @ Vh[:,kvh,:]
+
+  y = Hcat @ Wo.t()
+  return y + (bo if bo is not None else 0)
+
+@torch.no_grad()
+def swi_glu_expert(x, Wg,bg, Wu,bu, Wd,bd):
+  g = x @ Wg.t();  g = g + (bg if bg is not None else 0);  g = torch.nn.functional.silu(g)
+  u = x @ Wu.t();  u = u + (bu if bu is not None else 0)
+  h = g * u
+  y = h @ Wd.t();  y = y + (bd if bd is not None else 0)
+  return y
+
+@torch.no_grad()
+def moe_block(x, gate_w, gate_b, experts, k=8):
+  logits = x @ gate_w.t()                 # [T, E]
+  if gate_b is not None: logits = logits + gate_b
+  topk = torch.topk(logits, k=k, dim=-1)
+  idx = topk.indices                      # [T,k]
+  prob = torch.softmax(topk.values, dim=-1)  # softmax over k only
+  T, D = x.shape
+  y = torch.zeros_like(x)
+  for t in range(T):
+    for i in range(k):
+      e = idx[t,i].item()
+      p = prob[t,i].item()
+      y[t] += p * experts[e](x[t:t+1]).squeeze(0)
+  return y
+
+@torch.no_grad()
+def run_first_n_layers(model, x, n_layers, theta=10000.0, causal=True, qkn_mode="auto", dump_prefix=None, step=None):
+  """Runs the first n_layers (no final norm/head). If dump_prefix provided,
+     saves per-layer outputs as: {dump_prefix}.step{step}.L{i}.y.npy"""
   sd = model.state_dict()
   h = x
   for L in range(n_layers):
     # Norm1
     w1 = sd.get(f"model.layers.{L}.input_layernorm.weight")
-    if w1 is None: w1 = sd.get(f"model.layers.{L}.rms_1.weight")
+    if w1 is None:
+      w1 = sd.get(f"model.layers.{L}.rms_1.weight")
     x1 = rmsnorm(h, w1.float(), 1e-6)
 
     # Attn
@@ -32,22 +153,26 @@ def run_first_n_layers(model, x, n_layers, theta=10000.0, causal=True):
     qn = qn.float() if qn is not None else None
     kn = kn.float() if kn is not None else None
 
-    aout = attn_gqa_block(x1, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, causal, theta)
+    aout = attn_gqa_block(x1, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, qkn_mode, causal, theta)
     x2 = h + aout
 
     # Norm2
     w2 = sd.get(f"model.layers.{L}.post_attention_layernorm.weight")
-    if w2 is None: w2 = sd.get(f"model.layers.{L}.rms_2.weight")
+    if w2 is None:
+      w2 = sd.get(f"model.layers.{L}.rms_2.weight")
     x3 = rmsnorm(x2, w2.float(), 1e-6)
 
     # MoE
     gate_w = sd.get(f"model.layers.{L}.mlp.gate.weight")
-    if gate_w is None: gate_w = sd.get(f"model.layers.{L}.mlp.router.gate.weight")
+    if gate_w is None:
+      gate_w = sd.get(f"model.layers.{L}.mlp.router.gate.weight")
     gate_b = sd.get(f"model.layers.{L}.mlp.gate.bias")
-    if gate_b is None: gate_b = sd.get(f"model.layers.{L}.mlp.router.gate.bias")
+    if gate_b is None:
+      gate_b = sd.get(f"model.layers.{L}.mlp.router.gate.bias")
     gate_w = gate_w.float()
     gate_b = gate_b.float() if gate_b is not None else None
 
+    # Expert closures
     experts = []
     e = 0
     while True:
@@ -67,148 +192,99 @@ def run_first_n_layers(model, x, n_layers, theta=10000.0, causal=True):
         break
 
     h = x2 + moe_block(x3, gate_w, gate_b, experts, k=8)
+
+    if dump_prefix is not None and step is not None:
+      np.save(f"{dump_prefix}.step{step}.L{L}.y.npy", h.detach().cpu().numpy().astype(np.float32))
+
   return h
 
-# ==== helpers (identical to your layer/stack scripts) =================================
-
-def infer_head_dim(Dq, Dkv):
-  for d in [128, 96, 80, 64, 48, 40, 32]:
-    if Dq % d == 0 and Dkv % d == 0: return d
-  from math import gcd
-  g = gcd(Dq, Dkv); return g if g > 0 else Dq
-
-@torch.no_grad()
-def rmsnorm(x, w, eps):
-  var = (x * x).mean(dim=-1, keepdim=True)
-  xhat = x * torch.rsqrt(var + eps)
-  return xhat * w
-
-@torch.no_grad()
-def proj(x, W, b):  # x @ W^T + b
-  y = x @ W.t()
-  return y + b if b is not None else y
-
-@torch.no_grad()
-def apply_qk_norm(Q, K, qn, kn, n_q, n_kv, head_dim):
-  T = Q.shape[0]; Dq, Dkv = Q.shape[1], K.shape[1]
-  if qn is not None:
-    if qn.numel() == n_q: Q = Q.view(T,n_q,head_dim) * qn.view(1,n_q,1); Q = Q.view(T,Dq)
-    elif qn.numel() == Dq: Q = Q * qn
-  if kn is not None:
-    if kn.numel() == n_kv: K = K.view(T,n_kv,head_dim) * kn.view(1,n_kv,1); K = K.view(T,Dkv)
-    elif kn.numel() == Dkv: K = K * kn
-  return Q,K
-
-@torch.no_grad()
-def rope(Q, K, n_q, n_kv, head_dim, pos0, theta):
-  T = Q.shape[0]
-  i = torch.arange(0, head_dim, 2, dtype=Q.dtype)
-  base = theta ** (-i / head_dim)
-  p = torch.arange(pos0, pos0 + T, dtype=Q.dtype).unsqueeze(1)
-  ang = p * base
-  c = torch.cos(ang).unsqueeze(-1); s = torch.sin(ang).unsqueeze(-1)
-  def apply(x, H):
-    x = x.view(T,H,head_dim)
-    xe = x[:,:,0::2].transpose(1,2); xo = x[:,:,1::2].transpose(1,2)
-    xe2 =  xe * c - xo * s; xo2 = xo * c + xe * s
-    xe2 = xe2.transpose(1,2); xo2 = xo2.transpose(1,2)
-    y = torch.empty_like(x); y[:,:,0::2] = xe2; y[:,:,1::2] = xo2
-    return y.view(T, H*head_dim)
-  return apply(Q, n_q), apply(K, n_kv)
-
-@torch.no_grad()
-def attn_gqa_block(x, Wq,bq, Wk,bk, Wv,bv, Wo,bo, qn,kn, causal, theta):
-  T, D = x.shape
-  Dq, Dkv = Wq.shape[0], Wk.shape[0]
-  d = infer_head_dim(Dq, Dkv)
-  n_q = Dq // d; n_kv = Dkv // d
-  Q = proj(x,Wq,bq); K = proj(x,Wk,bk); V = proj(x,Wv,bv)
-  Q,K = apply_qk_norm(Q,K,qn,kn,n_q,n_kv,d)
-  Q,K = rope(Q,K,n_q,n_kv,d, pos0=0, theta=theta)
-  scale = 1.0 / (d**0.5)
-  Hcat = torch.zeros(T, Dq, dtype=x.dtype)
-  Qh = Q.view(T,n_q,d); Kh = K.view(T,n_kv,d); Vh = V.view(T,n_kv,d)
-  for h in range(n_q):
-    kvh = h % n_kv
-    S = (Qh[:,h,:] @ Kh[:,kvh,:].t()) * scale
-    if causal:
-      mask = torch.triu(torch.ones(T,T, dtype=torch.bool), diagonal=1)
-      S.masked_fill_(mask, float('-inf'))
-    P = torch.softmax(S, dim=-1)
-    Hcat[:, h*d:(h+1)*d] = P @ Vh[:,kvh,:]
-  y = Hcat @ Wo.t()
-  return y + (bo if bo is not None else 0)
-
-@torch.no_grad()
-def swi_glu_expert(x, Wg,bg, Wu,bu, Wd,bd):
-  g = x @ Wg.t();  g = g + (bg if bg is not None else 0);  g = torch.nn.functional.silu(g)
-  u = x @ Wu.t();  u = u + (bu if bu is not None else 0)
-  h = g * u
-  y = h @ Wd.t();  y = y + (bd if bd is not None else 0)
-  return y
-
-@torch.no_grad()
-def moe_block(x, gate_w, gate_b, experts, k=8):
-  logits = x @ gate_w.t()
-  if gate_b is not None: logits = logits + gate_b
-  topk = torch.topk(logits, k=k, dim=-1)
-  idx = topk.indices
-  prob = torch.softmax(topk.values, dim=-1)
-  T, D = x.shape
-  y = torch.zeros_like(x)
-  for t in range(T):
-    for i in range(k):
-      e = idx[t,i].item()
-      p = prob[t,i].item()
-      y[t] += p * experts[e](x[t:t+1]).squeeze(0)
-  return y
-
-# ==== main =====================================================================
+# ------------------------------- main -----------------------------------------
 
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument("--model", required=True)
   ap.add_argument("--layers", type=int, default=48)
   ap.add_argument("--seqlen", type=int, default=1)
-  ap.add_argument("--seed", type=int, default=123)
-  ap.add_argument("--rope-theta", type=float, default=10000.0)
+  ap.add_argument("--steps", type=int, default=1, help="How many new tokens to generate (no cache)")
+  ap.add_argument("--seed", type=int, default=125)
+  ap.add_argument("--rope-theta", type=float, default=10000000.0)
+  ap.add_argument("--qk-norm", type=str, default="auto", choices=["auto","on","off"], help="Force QK-Norm usage")
   ap.add_argument("--outbase", required=True)
   args = ap.parse_args()
 
   torch.manual_seed(args.seed); np.random.seed(args.seed)
   model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="cpu")
   model.eval()
-
-  V = model.config.vocab_size
-  ids = torch.randint(low=0, high=V, size=(args.seqlen,), dtype=torch.long)
-
-  # post-embed (T, D)
-  Wemb = model.get_input_embeddings().weight.detach().float()
-  x = Wemb.index_select(0, ids).contiguous()
-
-  # run N layers (pre-final norm/head)
-  h = run_first_n_layers(model, x.clone(), args.layers, theta=args.rope_theta, causal=True)
-
-  # final norm + head -> logits
   sd = model.state_dict()
-  w_final = sd.get("model.norm.weight")
-  if w_final is None:
-    sd.get("model.final_layernorm.weight")
-  xf = rmsnorm(h, w_final.float(), 1e-6)
-  Wout = sd.get("lm_head.weight")
-  if Wout is None:  # tied
-    Wout = sd["model.embed_tokens.weight"]
-  logits = xf @ Wout.float().t()
-  probs  = torch.softmax(logits, dim=-1).contiguous()    # [T, V]
 
-  np.save(args.outbase + ".ids.npy", ids.numpy().astype(np.int32))
-  np.save(args.outbase + ".x.npy", x.numpy().astype(np.float32))
-  np.save(args.outbase + ".y.npy", h.numpy().astype(np.float32))
-  np.save(args.outbase + ".logits.npy", logits.numpy().astype(np.float32))
-  np.save(args.outbase + ".probs.npy",  probs.cpu().numpy().astype(np.float32))
-  top = torch.topk(probs, k=5, dim=-1)
-  print(f"Saved {args.outbase}.ids.npy, .logits.npy, .probs.npy  (T={ids.numel()}, V={logits.size(-1)})")
-  print("Top-5 (t=0):", list(zip(top.indices[0].tolist(), [float(v) for v in top.values[0]])))
+  # ----- 1) Random prompt ids of length seqlen
+  V = model.config.vocab_size
+  #ids = torch.randint(low=0, high=V, size=(args.seqlen,), dtype=torch.long)
+  ids = torch.randint(low=0, high=V, size=(args.seqlen,), dtype=torch.long)
+  ids[0] = 151644
+  # ----- 2) Weight handle for embeddings & head
+  Wemb = sd["model.embed_tokens.weight"].float()
+  Wout = sd.get("lm_head.weight")
+  if Wout is None:
+    Wout = Wemb
+  else:
+    Wout = Wout.float()
+
+  # Containers for per-step last-row distributions
+  per_step_logits = []
+  per_step_probs  = []
+
+  for s in range(args.steps):
+    # x for current full sequence (prompt+generated so far)
+    x = Wemb.index_select(0, ids).contiguous().float()  # [T, D]
+
+    # save inputs for C debug
+    np.save(f"{args.outbase}.step{s}.ids.npy", ids.cpu().numpy().astype(np.int32))
+    np.save(f"{args.outbase}.step{s}.x.npy",   x.cpu().numpy().astype(np.float32))
+
+    # run N layers (no final norm/head), dumping each layer
+    h = run_first_n_layers(model, x.clone(), args.layers,
+                           theta=args.rope_theta, causal=True,
+                           qkn_mode=args.qk_norm,
+                           dump_prefix=args.outbase, step=s)
+
+    # final norm + head -> logits
+    w_final = sd.get("model.norm.weight")
+    if w_final is None:
+      w_final = sd.get("model.final_layernorm.weight")
+    if w_final is None:
+      raise RuntimeError("Could not find final norm (model.norm.weight / model.final_layernorm.weight).")
+    y_norm = rmsnorm(h, w_final.float(), 1e-6)   # [T, D]
+    logits = y_norm @ Wout.t()                   # [T, V]
+
+    # keep only last row distribution per step for C comparator
+    last_logits = logits[-1:].contiguous()
+    last_probs  = torch.softmax(last_logits, dim=-1).contiguous()
+    per_step_logits.append(last_logits)
+    per_step_probs.append(last_probs)
+
+    # greedy next token (from probs of last row)
+    next_id = int(torch.argmax(last_probs[0]).item())
+    ids = torch.cat([ids, torch.tensor([next_id], dtype=torch.long)], dim=0)
+
+  # stack per-step distributions into [steps, V]
+  per_step_logits = torch.cat(per_step_logits, dim=0)  # [S, V]
+  per_step_probs  = torch.cat(per_step_probs,  dim=0)  # [S, V]
+
+  # Final saves expected by test_model:
+  #   - ids.npy must contain prompt_len + steps (entire generated sequence)
+  #   - logits_or_probs.npy must be [steps, V] (match --nosoftmax choice in test program)
+  np.save(f"{args.outbase}.ids.npy", ids.cpu().numpy().astype(np.int32))
+  np.save(f"{args.outbase}.logits.npy", per_step_logits.cpu().numpy().astype(np.float32))
+  np.save(f"{args.outbase}.probs.npy",  per_step_probs.cpu().numpy().astype(np.float32))
+
+  print(f"Saved stepwise dumps under prefix {args.outbase} (steps={args.steps})")
+  print("Pass this to C with:")
+  print(f"  ./test_model <weights.bin> {args.outbase}.ids.npy {args.outbase}.probs.npy <N_layers> {args.rope_theta}")
+  print("or (if you prefer logits):")
+  print(f"  ./test_model <weights.bin> {args.outbase}.ids.npy {args.outbase}.logits.npy <N_layers> {args.rope_theta} --nosoftmax")
+  print("And for deep per-layer diffing, add:")
+  print(f"  --debug-prefix {args.outbase}  [optionally add  --qk-norm=on|off|auto  to both Python & C]")
 
 if __name__ == "__main__":
   main()

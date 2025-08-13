@@ -55,7 +55,7 @@ void rmsnorm_forward_f32(const float* x, const float* w,
                          int T, int d_model, float eps,
                          float* y);
 
-// GQA self-attention (no RoPE)
+static void rmsnorm_headwise_vec_inplace(float* x, const float* w, int head_dim, float eps);
 //
 // x: [T, d_model]
 // Q: Wq[b, d_model] where b = n_q * head_dim
@@ -64,15 +64,18 @@ void rmsnorm_forward_f32(const float* x, const float* w,
 // b*: optional biases; q_norm/k_norm can be per-channel (len=b/c) or per-head (len=n_q/n_kv)
 // causal: 1=causal mask, 0=none
 // scratch floats needed: T*(b + c + c) + T*T + T*b
+// NEW: pass qn_len / kn_len and rope_theta through.
 void attn_forward_f32_gqa(
   const float* x, int T, int d_model,
   const float* Wq, const float* bq,
   const float* Wk, const float* bk,
   const float* Wv, const float* bv,
   const float* Wo, const float* bo,
-  const float* q_norm, const float* k_norm,
-  int n_q, int n_kv, int head_dim, int causal,
-  float* scratch, float* y);
+  const float* qn, int qn_len,
+  const float* kn, int kn_len,
+  int n_q, int n_kv, int head_dim, int causal, float rope_theta,
+  float* scratch, float* y
+);
 
 // Apply RoPE to Q and K in-place (GQA-aware, no weights).
 // Q: [T, n_q*head_dim], K: [T, n_kv*head_dim]

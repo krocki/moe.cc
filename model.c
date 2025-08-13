@@ -51,6 +51,7 @@ void model_forward_f32(
   // 1) embedding lookup
   for (int t=0; t<T; ++t){
     const int id = ids[t];
+    fprintf(stderr, "[model_forward_f32] step %d, token id=%d\n", t,  id);
     if (id < 0 || id >= V){ fprintf(stderr,"token id %d out of range 0..%d\n", id, V-1); exit(1); }
     memcpy(&x[(size_t)t*D], &w->tok_emb[(size_t)id*D], sizeof(float)*(size_t)D);
   }
