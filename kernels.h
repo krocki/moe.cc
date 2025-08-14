@@ -87,28 +87,4 @@ void rope_apply_inplace_f32_gqa(
   int T, int n_q, int n_kv, int head_dim,
   int pos0, float theta);
 
-// One transformer layer (fp32), no KV cache.
-// x: [T, d_model] in/out (residual adds done inside)
-void layer_forward_f32(
-  float* x, int T, int d_model,
-  // Norm1
-  const float* w_norm1, float eps1,
-  // Attn weights/bias/norm (GQA)
-  const float* Wq,const float* bq,
-  const float* Wk,const float* bk,
-  const float* Wv,const float* bv,
-  const float* Wo,const float* bo,
-  const float* q_norm, const float* k_norm,
-  int n_q, int n_kv, int head_dim, int causal, float rope_theta,
-  // Norm2
-  const float* w_norm2, float eps2,
-  // MoE router + experts
-  const float* Wroute, const float* broute,
-  const float** Wg,const float** bg,
-  const float** Wu,const float** bu,
-  const float** Wd,const float** bd,
-  int E, int k, int d_ff,
-  // scratch buffers (reused across subops)
-  float* scratch_attn, float* scratch_moe, int* top_idx, float* top_p);
-
 #endif
