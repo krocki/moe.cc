@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python4
 # export.py — dump weights from HF to our tiny-bin format
 import argparse, json, os, struct, torch
 from transformers import AutoModelForCausalLM, AutoConfig

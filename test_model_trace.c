@@ -1,51 +1,196 @@
 // test_model_trace.c
-// ./test_model_trace all.bin q3_trace 4
-// Everything else (Q/K/V, norms, RoPE, softmax, MoE routing) is computed here.
+// Reference-matching forward w/ optional prefill length and hierarchical profiling.
+// Build: gcc -O2 -Wall -std=c11 test_model_trace.c -o test_model_trace
 //
-// RoPE: we compute angles internally to mirror Raschka's reference:
-//   inv = theta^( -2i/d ) for i in [0, d/2); angle = pos * inv
-//   apply: x' = x * cos + rot(x) * sin, where rot(x) = concat(-x[d/2:], x[:d/2])
-// This produces the same math as his `compute_rope_params` + `apply_rope`.
+// Usage (positional, same as before):
+//   ./test_model_trace <all.bin> <outbase> <steps>
 //
-// MoE: we perform router logits -> topk (k=8) -> softmax over the topk
-// and aggregate expert outputs with those probs to match the reference MoE path.
+// Extras (optional flags):
+//   --steps N         override positional steps (keeps backward compat)
+//   --prompt_len P    explicitly set prompt length (P in [1 .. len(ids)])
+//
+// Defaults / behavior:
+//   • If --prompt_len is NOT given: we match your current behavior:
+//       prompt_len = max(1, IDS_len - steps)
+//   • If --prompt_len IS given: we clamp to [1 .. IDS_len] and also clamp
+//       steps <= IDS_len - prompt_len
+//
+// Profiler:
+//   • Use PROF_START("name %d %d", a, b) and PROF_ENDF() pairs.
+//   • Nested scopes handled; prints a table at exit.
+//   • Labels are aggregated by formatted string => “unique function+args”.
+
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
+#include <time.h>
+#include <stdint.h>
+#include <inttypes.h>
 
+#include "model.h"
 #include "io.h"     // bin_load / bin_find / npy_load_* already available
 #include "utils.h"  // max_abs_diff, etc.
 
+//==============================
+// Toggle profiling on/off here
+//==============================
+#define PROFILING 1
+
+//==============================
+// Tiny hierarchical profiler
+//==============================
+#if PROFILING
+  #define PROF_KEY_MAX   128
+  #define PROF_MAX_STACK 256
+  #define PROF_TABLE_SZ  4096  // simple power-of-two hash table
+
+  typedef struct {
+    char     key[PROF_KEY_MAX];
+    uint64_t t_start_ns;
+    double   child_ns;    // sum of inclusive time of direct children
+  } prof_frame_t;
+
+  typedef struct {
+    uint64_t calls;
+    double   inclusive_ns;
+    double   exclusive_ns;
+    int      used;
+    char     key[PROF_KEY_MAX];
+  } prof_slot_t;
+
+  // Thread-local stack for nesting
+  static __thread struct {
+    prof_frame_t stack[PROF_MAX_STACK];
+    int sp;
+  } __prof_tls = { .sp = 0 };
+
+  // Global aggregate table (single-threaded test path; if multi-threaded, add a mutex)
+  static prof_slot_t __prof_tab[PROF_TABLE_SZ];
+
+  static inline uint64_t prof_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  }
+
+  static inline uint64_t prof_hash(const char* s) {
+    // FNV-1a 64-bit
+    uint64_t h = 1469598103934665603ull;
+    while (*s) { h ^= (unsigned char)(*s++); h *= 1099511628211ull; }
+    return h;
+  }
+
+  static void prof_accumulate(const char* key, uint64_t calls, double incl_ns, double excl_ns) {
+    uint64_t h = prof_hash(key);
+    uint32_t mask = PROF_TABLE_SZ - 1;
+    uint32_t idx = (uint32_t)(h & mask);
+    for (uint32_t i = 0; i < PROF_TABLE_SZ; ++i) {
+      uint32_t p = (idx + i) & mask;
+      if (!__prof_tab[p].used) {
+        __prof_tab[p].used = 1;
+        __prof_tab[p].calls = calls;
+        __prof_tab[p].inclusive_ns = incl_ns;
+        __prof_tab[p].exclusive_ns = excl_ns;
+        strncpy(__prof_tab[p].key, key, PROF_KEY_MAX-1);
+        __prof_tab[p].key[PROF_KEY_MAX-1] = '\0';
+        return;
+      }
+      if (__prof_tab[p].used && strncmp(__prof_tab[p].key, key, PROF_KEY_MAX) == 0) {
+        __prof_tab[p].calls       += calls;
+        __prof_tab[p].inclusive_ns+= incl_ns;
+        __prof_tab[p].exclusive_ns+= excl_ns;
+        return;
+      }
+    }
+    // Table full – silently drop in this tiny implementation
+  }
+  int cmp(const void* a, const void* b){
+    const prof_slot_t* x = (const prof_slot_t*)a;
+    const prof_slot_t* y = (const prof_slot_t*)b;
+    if (y->inclusive_ns > x->inclusive_ns) return 1;
+    if (y->inclusive_ns < x->inclusive_ns) return -1;
+    return 0;
+  }
+
+  static void prof_dump(void) {
+    // Collect used entries
+    int n = 0;
+    for (int i = 0; i < PROF_TABLE_SZ; ++i) if (__prof_tab[i].used) ++n;
+    if (n == 0) return;
+
+    prof_slot_t* arr = (prof_slot_t*)malloc(sizeof(prof_slot_t) * (size_t)n);
+    int j = 0;
+    for (int i = 0; i < PROF_TABLE_SZ; ++i) if (__prof_tab[i].used) arr[j++] = __prof_tab[i];
+
+    // Sort by inclusive time descending
+    qsort(arr, (size_t)n, sizeof(prof_slot_t), cmp);
+
+    printf("\n=== Profiling (inclusive/exclusive) ===\n");
+    printf("%-48s %8s %12s %12s %12s\n", "Key", "Calls", "Incl(ms)", "Excl(ms)", "AvgExcl(µs)");
+    for (int i = 0; i < n; ++i) {
+      double incl_ms = arr[i].inclusive_ns / 1.0e6;
+      double excl_ms = arr[i].exclusive_ns / 1.0e6;
+      double avg_excl_us = (arr[i].calls > 0) ? (arr[i].exclusive_ns / (double)arr[i].calls) / 1.0e3 : 0.0;
+      printf("%-48.48s %8" PRIu64 " %12.3f %12.3f %12.3f\n",
+             arr[i].key, arr[i].calls, incl_ms, excl_ms, avg_excl_us);
+    }
+    printf("=======================================\n\n");
+    free(arr);
+  }
+
+  static void prof_atexit(void){ prof_dump(); }
+
+  // Install at exit once
+  static void prof_init_once(void) {
+    static int once = 0;
+    if (!once) { atexit(prof_atexit); once = 1; }
+  }
+
+  // Macros
+  #define PROF_START(fmt, ...) do { \
+    prof_init_once(); \
+    if (__prof_tls.sp >= PROF_MAX_STACK) break; \
+    prof_frame_t* __fr = &__prof_tls.stack[__prof_tls.sp++]; \
+    snprintf(__fr->key, sizeof(__fr->key), (fmt), ##__VA_ARGS__); \
+    __fr->t_start_ns = prof_now_ns(); \
+    __fr->child_ns = 0.0; \
+  } while(0)
+
+  #define PROF_ENDF() do { \
+    if (__prof_tls.sp <= 0) break; \
+    prof_frame_t __fr = __prof_tls.stack[--__prof_tls.sp]; \
+    uint64_t __t_end = prof_now_ns(); \
+    double __incl = (double)(__t_end - __fr.t_start_ns); \
+    double __excl = __incl - __fr.child_ns; \
+    prof_accumulate(__fr.key, 1, __incl, __excl); \
+    if (__prof_tls.sp > 0) __prof_tls.stack[__prof_tls.sp-1].child_ns += __incl; \
+  } while(0)
+
+#else
+  #define PROF_START(fmt, ...) do{}while(0)
+  #define PROF_ENDF()          do{}while(0)
+#endif
+
+//==============================
+// Debug logging
+//==============================
 #ifdef DEBUG
   #define DBG(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
 #else
   #define DBG(...)
 #endif
 
-#ifdef BENCH
-  #define TIMER_DECL struct timespec __t0, __t1
-  #define TIMER_START() clock_gettime(CLOCK_MONOTONIC, &__t0)
-  #define TIMER_END_MS(ms_out) do { \
-      clock_gettime(CLOCK_MONOTONIC, &__t1); \
-      double __ms = (__t1.tv_sec - __t0.tv_sec) * 1000.0 + \
-                    (__t1.tv_nsec - __t0.tv_nsec) / 1.0e6; \
-      (ms_out) = __ms; \
-    } while(0)
-#else
-  #define TIMER_DECL
-  #define TIMER_START()     do{}while(0)
-  #define TIMER_END_MS(x)   do{ (void)(x); }while(0)
-#endif
-
-
-void matmul_f32(const float* A, const float* B, float* C,
-                int M, int N, int K) {
-  TIMER_DECL; double ms=0.0;
-  DBG("[matmul] A[%d,%d] * W^T[%d,%d] -> Y[%d,%d]\n", M, K, N, K, M, N);
-  TIMER_START();
+//==============================
+// Math kernels (profiled)
+//==============================
+static void matmul_f32(const float* A, const float* B, float* C,
+                       int M, int N, int K) {
+  PROF_START("matmul_f32 M=%d N=%d K=%d", M, N, K);
   for (int m = 0; m < M; ++m) {
     const float* a = A + m*K;
     float* c = C + m*N;
@@ -56,123 +201,57 @@ void matmul_f32(const float* A, const float* B, float* C,
       c[n] = acc;
     }
   }
-  TIMER_END_MS(ms);
-#ifdef BENCH
-  DBG("[matmul] done in %.3f ms\n", ms);
-#else
-  DBG("[matmul] done\n");
-#endif
+  PROF_ENDF();
 }
 
-void silu_f32(float* x, int n) {
+static void silu_f32(float* x, int n) {
+  PROF_START("silu_f32 n=%d", n);
   for (int i = 0; i < n; ++i) {
     float v = x[i];
     x[i] = v / (1.0f + expf(-v));
   }
+  PROF_ENDF();
 }
 
 // RMSNorm forward
-// x: [T, d_model]
-// w: [d_model] (scale weights)
-// eps: epsilon for numerical stability
-// y: [T, d_model] output
-void rmsnorm_forward_f32(const float* x, const float* w,
-                         int T, int d_model, float eps,
-                         float* y) {
-#ifdef BENCH
-  double ms = 0.0;
-#endif
-  DBG("[rmsnorm] T=%d d_model=%d eps=%g\n", T, d_model, eps);
-#ifdef BENCH
-  TIMER_DECL;
-  TIMER_START();
-#endif
+// x: [T, d_model]; w: [d_model] (scale weights); eps: epsilon
+// y: [T, d_model]
+static void rmsnorm_forward_f32(const float* x, const float* w,
+                                int T, int d_model, float eps,
+                                float* y) {
+  PROF_START("rmsnorm T=%d D=%d", T, d_model);
   for (int t = 0; t < T; ++t) {
-    const float* xt = x + t * d_model;
-    float* yt = y + t * d_model;
+    const float* xt = x + (size_t)t * d_model;
+    float* yt = y + (size_t)t * d_model;
     float msq = 0.0f;
-    for (int i = 0; i < d_model; ++i)
-      msq += xt[i] * xt[i];
+    for (int i = 0; i < d_model; ++i) msq += xt[i] * xt[i];
     msq /= (float)d_model;
     float inv = 1.0f / sqrtf(msq + eps);
-    for (int i = 0; i < d_model; ++i)
-      yt[i] = xt[i] * inv * (w ? w[i] : 1.0f);
+    for (int i = 0; i < d_model; ++i) yt[i] = xt[i] * inv * (w ? w[i] : 1.0f);
   }
-#ifdef BENCH
-  TIMER_END_MS(ms);
-  DBG("[rmsnorm] done in %.3f ms\n", ms);
-#else
-  DBG("[rmsnorm] done\n");
-#endif
+  PROF_ENDF();
 }
 
-// -----------------------------
-// Minimal model "header" inline
-// -----------------------------
-typedef struct {
-  int d_model;
-  int n_layers;
-  int head_dim;
-  int n_q;
-  int n_kv;
-  int d_ff;         // per expert
-  int n_experts;    // per layer
-  int top_k;        // router top-k
-  int vocab_size;
-  int causal;       // 0/1
-  float rope_theta; // (unused when using dumped cos/sin; kept for clarity)
-  float rms_eps;
-} QwenConfig;
-
-typedef struct {
-  // attention
-  const float* Wq; const float* bq;
-  const float* Wk; const float* bk;
-  const float* Wv; const float* bv;
-  const float* Wo; const float* bo;
-  const float* q_norm; // [head_dim] or NULL
-  const float* k_norm; // [head_dim] or NULL
-  // norms
-  const float* rms1_w; // [d_model]
-  const float* rms2_w; // [d_model]
-  // router
-  const float* router_w; // [E, d_model]
-  const float* router_b; // [E] or NULL
-  // experts (arrays of E pointers; biases are NULL for Qwen3/A3B)
-  const float** Wg; // [E][d_ff, d_model]
-  const float** Wu; // [E][d_ff, d_model]
-  const float** Wd; // [E][d_model, d_ff]
-} QwenLayerWeights;
-
-typedef struct {
-  // embedding
-  const float* tok_emb;      // [vocab, d_model]
-  // final norm
-  const float* final_norm_w; // [d_model]
-  // output head (NULL => tied with tok_emb)
-  const float* lm_head;      // [vocab, d_model] or NULL
-  // layers
-  QwenLayerWeights* layers;  // [n_layers]
-} QwenWeights;
-
-// -----------------------------
+//==============================
 // Helpers
-// -----------------------------
+//==============================
 static void softmax_rows(float* mat, int rows, int cols) {
+  PROF_START("softmax rows=%d cols=%d", rows, cols);
   for (int r = 0; r < rows; ++r) {
-    float* row = &mat[r * cols];
+    float* row = &mat[(size_t)r * cols];
     float maxv = row[0];
     for (int c = 1; c < cols; ++c) if (row[c] > maxv) maxv = row[c];
     float sum = 0.f;
-    for (int c = 0; c < cols; ++c) { row[c] = expf(row[c] - maxv); sum += row[c]; }
+    for (int c = 0; c < cols; ++c) { float e = expf(row[c] - maxv); row[c] = e; sum += e; }
     float inv = 1.0f / (sum + 1e-9f);
     for (int c = 0; c < cols; ++c) row[c] *= inv;
   }
+  PROF_ENDF();
 }
 
-// top-k over a single vector of length E; outputs top_k indices+scores (descending).
-// Simple O(E * top_k) selection; fine for test path.
+// top-k over vector x[E] -> k indices/values (descending)
 static void topk_desc(const float* x, int E, int top_k, int* out_idx, float* out_val) {
+  PROF_START("topk_desc E=%d k=%d", E, top_k);
   for (int i = 0; i < top_k; ++i) { out_val[i] = -INFINITY; out_idx[i] = -1; }
   for (int e = 0; e < E; ++e) {
     float v = x[e];
@@ -183,26 +262,22 @@ static void topk_desc(const float* x, int E, int top_k, int* out_idx, float* out
       out_val[pos] = v; out_idx[pos] = e;
     }
   }
-}
-static inline void rope_rotate_pair(float* even, float* odd, float c, float s) {
-  float e = *even, o = *odd;
-  *even =  e * c - o * s;   // new_even
-  *odd  =  o * c + e * s;   // new_odd
+  PROF_ENDF();
 }
 
-// Compute & apply standard RoPE to Q and K (GQA-aware), in-place.
-// Shapes:
-//   Q: [T, n_q * head_dim]  (contiguous heads)
-//   K: [T, n_kv * head_dim]
-// Parameters:
-//   pos0  : starting position (0 for prompt; add cache length when decoding)
-//   theta : rotary base (Qwen3 default: 10_000_000.0 for long context)
-// Mirrors Raschka's `compute_rope_params` + `apply_rope` numerics.
+static inline void rope_rotate_pair(float* even, float* odd, float c, float s) {
+  float e = *even, o = *odd;
+  *even =  e * c - o * s;
+  *odd  =  o * c + e * s;
+}
+
+// Apply standard RoPE to Q and K (GQA-aware), in-place.
 static void rope_apply_inplace_f32_gqa(
   float* Q, float* K,
   int T, int n_q, int n_kv, int head_dim,
   int pos0, float theta)
 {
+  PROF_START("rope T=%d nq=%d nkv=%d dh=%d", T, n_q, n_kv, head_dim);
   const int Dq  = n_q  * head_dim;
   const int Dkv = n_kv * head_dim;
   const int d2  = head_dim / 2;
@@ -210,20 +285,13 @@ static void rope_apply_inplace_f32_gqa(
     fprintf(stderr, "[rope] head_dim must be even, got %d\n", head_dim);
     exit(1);
   }
-
-  // inv_freq[i] = theta^( -2i / head_dim ), i in [0, d2)
   float* inv = (float*)malloc(sizeof(float) * (size_t)d2);
   for (int i = 0; i < d2; ++i) {
     float exponent = -2.0f * (float)i / (float)head_dim;
     inv[i] = powf(theta, exponent);
   }
-
-  // For each token position p = pos0 + t, we rotate each head's even/odd pairs.
   for (int t = 0; t < T; ++t) {
     const float p = (float)(pos0 + t);
-    // Precompute cos/sin vector for this position, first half only (d2 angles).
-    // This is exactly what the reference builds via its cos/sin buffers.
-    // (We don't allocate full [T, d]; compute on the fly to keep it simple.)
     for (int h = 0; h < n_q; ++h) {
       float* qh = &Q[(size_t)t*Dq + (size_t)h*head_dim];
       for (int i = 0; i < d2; ++i) {
@@ -242,106 +310,101 @@ static void rope_apply_inplace_f32_gqa(
     }
   }
   free(inv);
+  PROF_ENDF();
 }
 
-// -----------------------------
+//==============================
 // Attention + MoE (single layer)
-// -----------------------------
+//==============================
 static void attention_forward_f32(
   const float* x, int T, int d_model,
   const float* Wq, const float* bq,
   const float* Wk, const float* bk,
   const float* Wv, const float* bv,
   const float* Wo, const float* bo,
-  const float* qn, const float* kn, // NULL if absent
+  const float* qn, const float* kn,
   int n_q, int n_kv, int head_dim, int causal,
   const float rope_theta, const float rms_eps,
   float* scratch, float* y_out)
 {
+  PROF_START("attention T=%d dq=%d nkv=%d dh=%d", T, n_q*head_dim, n_kv, head_dim);
   const float scale = 1.0f / sqrtf((float)head_dim);
   const int Dq  = n_q  * head_dim;
   const int Dkv = n_kv * head_dim;
 
   float* Q    = scratch;            // [T, Dq]
-  float* K    = Q + T*Dq;           // [T, Dkv]
-  float* V    = K + T*Dkv;          // [T, Dkv]
-  float* S    = V + T*Dkv;          // [T, T] (reused row-wise)
-  float* Hcat = S + T*T;            // [T, Dq]
+  float* K    = Q + (size_t)T*Dq;   // [T, Dkv]
+  float* V    = K + (size_t)T*Dkv;  // [T, Dkv]
+  float* S    = V + (size_t)T*Dkv;  // [T, T]
+  float* Hcat = S + (size_t)T*T;    // [T, Dq]
 
-  // Projections
   matmul_f32(x, Wq, Q, T, Dq,  d_model);
   matmul_f32(x, Wk, K, T, Dkv, d_model);
   matmul_f32(x, Wv, V, T, Dkv, d_model);
-  // bias ?
-  if (bq) for (int t=0; t<T; ++t) for (int i=0; i<Dq;  ++i) Q[t*Dq  + i] += bq[i];
-  if (bk) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) K[t*Dkv + i] += bk[i];
-  if (bv) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) V[t*Dkv + i] += bv[i];
 
-  // QK RMSNorm per head (Raschka-compatible RMS over last dim, learned scale)
-  const float eps = rms_eps;
+  if (bq) for (int t=0; t<T; ++t) for (int i=0; i<Dq;  ++i) Q[(size_t)t*Dq  + i] += bq[i];
+  if (bk) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) K[(size_t)t*Dkv + i] += bk[i];
+  if (bv) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) V[(size_t)t*Dkv + i] += bv[i];
+
+  // Q/K RMSNorm per head
   if (qn) {
     for (int t=0; t<T; ++t) {
-      float* Qt = &Q[t*Dq];
+      float* Qt = &Q[(size_t)t*Dq];
       for (int h=0; h<n_q; ++h) {
-        float* v = &Qt[h*head_dim];
+        float* v = &Qt[(size_t)h*head_dim];
         float msq=0.f; for(int d=0; d<head_dim; ++d){ float z=v[d]; msq+=z*z; }
-        float inv = 1.0f / sqrtf(msq/(float)head_dim + eps);
+        float inv = 1.0f / sqrtf(msq/(float)head_dim + rms_eps);
         for (int d=0; d<head_dim; ++d) v[d] = (v[d]*inv) * qn[d];
       }
     }
   }
   if (kn) {
     for (int t=0; t<T; ++t) {
-      float* Kt = &K[t*Dkv];
+      float* Kt = &K[(size_t)t*Dkv];
       for (int h=0; h<n_kv; ++h) {
-        float* v = &Kt[h*head_dim];
+        float* v = &Kt[(size_t)h*head_dim];
         float msq=0.f; for(int d=0; d<head_dim; ++d){ float z=v[d]; msq+=z*z; }
-        float inv = 1.0f / sqrtf(msq/(float)head_dim + eps);
+        float inv = 1.0f / sqrtf(msq/(float)head_dim + rms_eps);
         for (int d=0; d<head_dim; ++d) v[d] = (v[d]*inv) * kn[d];
       }
     }
   }
 
-  // 3) RoPE (GQA-aware), computed locally (no dumped cos/sin files)
   rope_apply_inplace_f32_gqa(Q, K, T, n_q, n_kv, head_dim, /*pos0=*/0, rope_theta);
 
-  // GQA: each block of (n_q / n_kv) Q-heads uses the same K,V head
   const int group = n_q / n_kv;
 
-  // scores + softmax + context
   for (int h=0; h<n_q; ++h) {
     const int kvh = h / group;
     for (int tq=0; tq<T; ++tq) {
-      const float* qv = &Q[tq*Dq + h*head_dim];
-      float* Sout = &S[tq*T];
+      const float* qv = &Q[(size_t)tq*Dq + (size_t)h*head_dim];
+      float* Sout = &S[(size_t)tq*T];
       for (int tk=0; tk<T; ++tk) {
-        const float* kv = &K[tk*Dkv + kvh*head_dim];
+        const float* kv = &K[(size_t)tk*Dkv + (size_t)kvh*head_dim];
         float dot=0.f; for (int d=0; d<head_dim; ++d) dot += qv[d]*kv[d];
         Sout[tk] = dot * scale;
       }
-      if (causal) for (int tk=tq+1; tk<T; ++tk) S[tq*T + tk] = -INFINITY;
-      // softmax row
+      if (causal) for (int tk=tq+1; tk<T; ++tk) S[(size_t)tq*T + tk] = -INFINITY;
       float m=Sout[0]; for(int i=1;i<T;++i) if(Sout[i]>m) m=Sout[i];
       float ssum=0.f; for(int i=0;i<T;++i){ float e = expf(Sout[i]-m); Sout[i]=e; ssum+=e; }
       float inv=1.f/(ssum+1e-9f);
       for(int i=0;i<T;++i) Sout[i]*=inv;
     }
-    // context mix
     for (int tq=0; tq<T; ++tq) {
-      const float* Prow = &S[tq*T];
-      float* out = &Hcat[tq*Dq + h*head_dim];
+      const float* Prow = &S[(size_t)tq*T];
+      float* out = &Hcat[(size_t)tq*Dq + (size_t)h*head_dim];
       for (int d=0; d<head_dim; ++d) out[d]=0.f;
       for (int tk=0; tk<T; ++tk) {
-        const float* vv = &V[tk*Dkv + kvh*head_dim];
+        const float* vv = &V[(size_t)tk*Dkv + (size_t)kvh*head_dim];
         const float p = Prow[tk];
         for (int d=0; d<head_dim; ++d) out[d] += p * vv[d];
       }
     }
   }
 
-  // output projection
   matmul_f32(Hcat, Wo, y_out, T, d_model, Dq);
-  if (bo) for (int t=0; t<T; ++t) for (int i=0; i<d_model; ++i) y_out[t*d_model + i] += bo[i];
+  if (bo) for (int t=0; t<T; ++t) for (int i=0; i<d_model; ++i) y_out[(size_t)t*d_model + i] += bo[i];
+  PROF_ENDF();
 }
 
 // One layer: norm1 -> attn -> +res -> norm2 -> MoE -> +res
@@ -353,16 +416,16 @@ static void layer_forward_f32(
   int n_experts, int top_k, int d_ff,
   float* scratch_attn, float* scratch_moe, int* tmp_idx, float* tmp_val)
 {
+  PROF_START("layer_forward T=%d", T);
+
   // temp buffers (reuse scratch_attn tail as temp D vectors)
   float* x_norm1  = scratch_attn + (size_t)T*(n_q*head_dim + 2*n_kv*head_dim) + (size_t)T*T + (size_t)T*(n_q*head_dim);
   float* attn_out = x_norm1 + (size_t)T*d_model;
   float* x_after  = attn_out + (size_t)T*d_model;
   float* x_norm2  = x_after  + (size_t)T*d_model;
 
-  // 1) norm1
   rmsnorm_forward_f32(x, lw->rms1_w, T, d_model, rms_eps, x_norm1);
 
-  // 2) attention
   attention_forward_f32(
     x_norm1, T, d_model,
     lw->Wq, lw->bq, lw->Wk, lw->bk, lw->Wv, lw->bv, lw->Wo, lw->bo,
@@ -372,21 +435,17 @@ static void layer_forward_f32(
     scratch_attn, attn_out
   );
 
-  // residual
   for (int i=0;i<T*d_model;++i) x_after[i] = x[i] + attn_out[i];
-
-  // 3) norm2
   rmsnorm_forward_f32(x_after, lw->rms2_w, T, d_model, rms_eps, x_norm2);
 
-  // 4) router logits
-  // logits[t,:] = x_norm2[t,:] @ router_w^T + router_b
+  // router logits
   float* logits = scratch_moe;                    // [T, E]
   matmul_f32(x_norm2, lw->router_w, logits, T, n_experts, d_model);
   if (lw->router_b) {
-    for (int t=0;t<T;++t) for (int e=0;e<n_experts;++e) logits[t*n_experts + e] += lw->router_b[e];
+    for (int t=0;t<T;++t) for (int e=0;e<n_experts;++e) logits[(size_t)t*n_experts + e] += lw->router_b[e];
   }
 
-  // 5) expert path with local top-k routing (softmax over top-k only)
+  // experts (top-k routing)
   float* moe_out = scratch_moe + (size_t)T * n_experts; // [T, d_model]
   for (int i=0;i<T*d_model;++i) moe_out[i] = 0.f;
 
@@ -397,7 +456,7 @@ static void layer_forward_f32(
   for (int t=0; t<T; ++t) {
     const float* log_t = &logits[(size_t)t * n_experts];
     topk_desc(log_t, n_experts, top_k, tmp_idx, tmp_val);
-    // softmax over top-k scores
+    // softmax over top-k
     float maxv = tmp_val[0];
     for (int i=1;i<top_k;++i) if (tmp_val[i] > maxv) maxv = tmp_val[i];
     float sum = 0.f;
@@ -408,38 +467,34 @@ static void layer_forward_f32(
     for (int i=0;i<top_k;++i){
       int e = tmp_idx[i];
       float p = tmp_val[i];
-      // g = silu( x_norm2[t] @ Wg[e]^T )
       matmul_f32(&x_norm2[(size_t)t*d_model], lw->Wg[e], tmp_g, 1, d_ff, d_model);
       silu_f32(tmp_g, d_ff);
-      // u = x_norm2[t] @ Wu[e]^T
       matmul_f32(&x_norm2[(size_t)t*d_model], lw->Wu[e], tmp_u, 1, d_ff, d_model);
-      // h = g * u
       for (int q=0;q<d_ff;++q) tmp_g[q] *= tmp_u[q];
-      // y = h @ Wd[e]^T
       matmul_f32(tmp_g, lw->Wd[e], tmp_y, 1, d_model, d_ff);
-      // accumulate
       for (int q=0;q<d_model;++q) moe_out[(size_t)t*d_model + q] += p * tmp_y[q];
     }
   }
 
-  // 6) residual to x
   for (int i=0;i<T*d_model;++i) x[i] = x_after[i] + moe_out[i];
 
   free(tmp_g); free(tmp_u); free(tmp_y);
+  PROF_ENDF();
 }
 
-// -----------------------------
+//==============================
 // Full forward (no file I/O)
-// -----------------------------
+//==============================
 static void model_forward_f32(
   const int* ids, int T,
   const QwenConfig* cfg,
   const QwenWeights* w,
   int apply_softmax,
-  float* out_last // [1, vocab] (only last token logits/probs)
+  float* out_last // [1, vocab]
 ){
+  PROF_START("model_forward T=%d", T);
   const int D = cfg->d_model, V = cfg->vocab_size, L = cfg->n_layers;
-  const int Dq0 = cfg->n_q * cfg->head_dim;
+  const int Dq0  = cfg->n_q  * cfg->head_dim;
   const int Dkv0 = cfg->n_kv * cfg->head_dim;
 
   size_t attn_f  = (size_t)T*(Dq0 + 2*Dkv0) + (size_t)T*T + (size_t)T*Dq0;
@@ -451,11 +506,13 @@ static void model_forward_f32(
 
   float* x = (float*)malloc(sizeof(float)*(size_t)T*D);
 
-  // embedding lookup
+  // embeddings
+  PROF_START("embedding_lookup T=%d D=%d", T, D);
   for (int t=0; t<T; ++t) {
     int id = ids[t];
     memcpy(&x[(size_t)t*D], &w->tok_emb[(size_t)id*D], sizeof(float)*(size_t)D);
   }
+  PROF_ENDF();
 
   // stack
   for (int l=0; l<L; ++l) {
@@ -468,14 +525,11 @@ static void model_forward_f32(
     );
   }
 
-  // final norm + head
+  // final norm + head (only last row into out_last)
   float* x_final = (float*)malloc(sizeof(float)*(size_t)T*D);
   rmsnorm_forward_f32(x, w->final_norm_w, T, D, cfg->rms_eps, x_final);
 
   const float* Wout = w->lm_head ? w->lm_head : w->tok_emb;
-  // Only compute last row logits into out_last (saves time/mem)
-  // out_last = x_final[T-1,:] @ Wout^T
-  // Reuse matmul on a single row for simplicity:
   matmul_f32(&x_final[(size_t)(T-1)*D], Wout, out_last, 1, V, D);
 
   if (apply_softmax) softmax_rows(out_last, 1, V);
@@ -483,216 +537,183 @@ static void model_forward_f32(
   free(x_final);
   free(x);
   free(scratch_attn); free(scratch_moe); free(tmp_idx); free(tmp_val);
+  PROF_ENDF();
 }
 
-// -----------------------------
-// Weight loading (one-time)
-// -----------------------------
-static TensorBin* need(BinFile* b, const char* k){
-  TensorBin* t = bin_find(b,k);
-  if(!t){ fprintf(stderr,"missing %s\n", k); exit(1); }
-  return t;
-}
-static TensorBin* maybe(BinFile* b, const char* k){ return bin_find(b,k); }
+//==============================
+// Weight loading (external)
+//==============================
+// Expect: void load_all_weights(BinFile*, QwenConfig*, QwenWeights*);
+// Provided elsewhere in your project.
 
-// Fill QwenWeights/QwenConfig from all.bin (Qwen/Qwen3-30B-A3B layout).
-// Only strings appear here (one-time), never inside the forward loops.
-static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
-  // Infer sizes (consistent with your verified setup)
-  // d_model, vocab, head_dim, n_q, n_kv, n_layers, d_ff, n_experts, top_k
-  TensorBin* Wq0 = need(bf,"model.layers.0.self_attn.q_proj.weight");
-  TensorBin* Wk0 = need(bf,"model.layers.0.self_attn.k_proj.weight");
-  TensorBin* emb = need(bf,"model.embed_tokens.weight");
-  TensorBin* norm = maybe(bf,"model.norm.weight");
-  if (!norm) norm = need(bf,"model.final_layernorm.weight");
+//==============================
+// Simple argument parser
+//==============================
+typedef struct {
+  const char* allfile;
+  const char* outbase;
+  int   steps;            // how many generation steps to evaluate
+  int   prompt_len_opt;   // 0 if not specified; else a positive value
+  int   prompt_len;       // resolved prompt length
+} Args;
 
-  cfg->d_model   = Wq0->shape[1];
-  cfg->head_dim  = maybe(bf,"model.layers.0.self_attn.q_norm.weight")
-                   ? maybe(bf,"model.layers.0.self_attn.q_norm.weight")->shape[0]
-                   : (Wq0->shape[0] / 32);
-  cfg->n_q       = Wq0->shape[0] / cfg->head_dim;
-  cfg->n_kv      = Wk0->shape[0] / cfg->head_dim;
-  cfg->vocab_size= emb->shape[0];
-  cfg->n_layers  = 0;
-  // count layers by probing L until miss
-  for (;;) {
-    char key[256];
-    snprintf(key,sizeof(key),"model.layers.%d.self_attn.q_proj.weight", cfg->n_layers);
-    if (!bin_find(bf,key)) break;
-    cfg->n_layers++;
-  }
-
-  // MoE sizes
-  // infer n_experts and d_ff from first layer’s experts
-  int E = 0, d_ff = -1;
-  for (;;) {
-    char k_down[256];
-    snprintf(k_down,sizeof(k_down),"model.layers.0.mlp.experts.%d.down_proj.weight", E);
-    TensorBin* t = bin_find(bf,k_down);
-    if (!t) break;
-    d_ff = t->shape[1];
-    E++;
-  }
-  if (E==0 || d_ff<=0) { fprintf(stderr,"infer MoE sizes failed\n"); exit(1); }
-  cfg->n_experts = E;
-  cfg->d_ff      = d_ff;
-  // infer top_k from router weight vs Python dump (use common default 8)
-  cfg->top_k     = 8;
-  cfg->causal    = 1;
-  cfg->rope_theta= 10000000.f;
-  cfg->rms_eps   = 1e-6f;
-
-  w->tok_emb      = (const float*)emb->data;
-  w->final_norm_w = (const float*)norm->data;
-  // head: use lm_head if present, else tie
-  TensorBin* head = maybe(bf,"lm_head.weight");
-  w->lm_head = head ? (const float*)head->data : NULL;
-
-  // allocate layers
-  w->layers = (QwenLayerWeights*)calloc((size_t)cfg->n_layers, sizeof(QwenLayerWeights));
-
-  for (int L=0; L<cfg->n_layers; ++L) {
-    QwenLayerWeights* lw = &w->layers[L];
-    char k[256];
-
-    // attention weights/biases
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.q_proj.weight",L);
-    lw->Wq = (const float*)need(bf,k)->data;
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.k_proj.weight",L);
-    lw->Wk = (const float*)need(bf,k)->data;
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.v_proj.weight",L);
-    lw->Wv = (const float*)need(bf,k)->data;
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.o_proj.weight",L);
-    lw->Wo = (const float*)need(bf,k)->data;
-
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.q_proj.bias",L);
-    lw->bq = (maybe(bf,k) && maybe(bf,k)->dtype==0) ? (const float*)maybe(bf,k)->data : NULL;
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.k_proj.bias",L);
-    lw->bk = (maybe(bf,k) && maybe(bf,k)->dtype==0) ? (const float*)maybe(bf,k)->data : NULL;
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.v_proj.bias",L);
-    lw->bv = (maybe(bf,k) && maybe(bf,k)->dtype==0) ? (const float*)maybe(bf,k)->data : NULL;
-    snprintf(k,sizeof(k),"model.layers.%d.self_attn.o_proj.bias",L);
-    lw->bo = (maybe(bf,k) && maybe(bf,k)->dtype==0) ? (const float*)maybe(bf,k)->data : NULL;
-
-    // qk norm (auto-present for Qwen3 A3B)
-    TensorBin* qn = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.self_attn.q_norm.weight",L), k));
-    TensorBin* kn = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.self_attn.k_norm.weight",L), k));
-    lw->q_norm = qn ? (const float*)qn->data : NULL;
-    lw->k_norm = kn ? (const float*)kn->data : NULL;
-
-    // norms
-    TensorBin* n1 = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.input_layernorm.weight",L), k));
-    if (!n1) { snprintf(k, sizeof(k), "model.layers.%d.rms_1.weight", L); n1 = need(bf, k); }
-    lw->rms1_w = (const float*)n1->data;
-
-    TensorBin* n2 = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.post_attention_layernorm.weight",L), k));
-    if (!n2) { snprintf(k, sizeof(k), "model.layers.%d.rms_2.weight", L); n2 = need(bf, k); }
-    lw->rms2_w = (const float*)n2->data;
-
-    // router
-    TensorBin* RW = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.mlp.gate.weight",L), k));
-    if (!RW) { snprintf(k, sizeof(k), "model.layers.%d.mlp.router.gate.weight", L); RW = need(bf, k); }
-    lw->router_w = (const float*)RW->data;
-
-    TensorBin* RB = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.mlp.gate.bias",L), k));
-    lw->router_b = (RB && RB->dtype==0) ? (const float*)RB->data : NULL;
-
-    // experts arrays
-    lw->Wg = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
-    lw->Wu = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
-    lw->Wd = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
-    for (int e=0;e<cfg->n_experts;++e){
-      snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight",L,e);
-      lw->Wg[e] = (const float*)need(bf,k)->data;
-      snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight",L,e);
-      lw->Wu[e] = (const float*)need(bf,k)->data;
-      snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight",L,e);
-      lw->Wd[e] = (const float*)need(bf,k)->data;
-    }
-  }
+static void usage(const char* prog){
+  fprintf(stderr,
+    "Usage:\n"
+    "  %s <all.bin> <outbase> <steps> [--prompt_len P]\n"
+    "  %s <all.bin> <outbase> --steps N [--prompt_len P]\n"
+    "\nNotes:\n"
+    "  • If --prompt_len is not given, defaults to IDS_len - steps (clamped to >=1).\n"
+    "  • If --prompt_len is given, steps will be clamped so prompt_len + steps <= IDS_len.\n",
+    prog, prog);
 }
 
-// -----------------------------
+static int parse_args(int argc, char** argv, Args* a){
+  if (argc < 2) { usage(argv[0]); return -1; }
+  memset(a, 0, sizeof(*a));
+
+  // First pass: collect positional if present
+  int pos = 0;
+  for (int i=1; i<argc; ++i){
+    const char* s = argv[i];
+    if (s[0] == '-' && s[1] == '-') break; // flags begin
+    if (pos == 0) a->allfile = s;
+    else if (pos == 1) a->outbase = s;
+    else if (pos == 2) a->steps = atoi(s);
+    ++pos;
+  }
+  // Second pass: flags
+  for (int i=1; i<argc; ++i){
+    const char* s = argv[i];
+    if (strcmp(s,"--steps")==0 && i+1<argc) { a->steps = atoi(argv[++i]); continue; }
+    if (strcmp(s,"--prompt_len")==0 && i+1<argc) { a->prompt_len_opt = 1; a->prompt_len = atoi(argv[++i]); continue; }
+  }
+
+  if (!a->allfile || !a->outbase || a->steps <= 0) {
+    usage(argv[0]);
+    return -1;
+  }
+  return 0;
+}
+
+//==============================
 // Main
-// -----------------------------
+//==============================
 int main(int argc, char** argv) {
-  if (argc < 4) {
-    fprintf(stderr,"Usage: %s <all.bin> <outbase> <steps>\n", argv[0]);
+  Args args;
+  if (parse_args(argc, argv, &args) != 0) return 1;
+
+  // Load the model weights from the binary file
+  BinFile* bin_file = bin_load(args.allfile);
+  if (!bin_file) { fprintf(stderr, "Failed to load binary file\n"); return 1; }
+
+  QwenConfig config;
+  QwenWeights weights;
+  load_all_weights(bin_file, &config, &weights);
+  printf("[model] d_model=%d n_layers=%d head_dim=%d n_q=%d n_kv=%d vocab=%d\n",
+         config.d_model, config.n_layers, config.head_dim, config.n_q, config.n_kv, config.vocab_size);
+
+  // Load reference tokens, logits, and probs from numpy files
+  char ids_path[512], logits_path[512], probs_path[512];
+  snprintf(ids_path, sizeof(ids_path), "%s.ids.npy", args.outbase);
+  snprintf(logits_path, sizeof(logits_path), "%s.logits.npy", args.outbase);
+  snprintf(probs_path, sizeof(probs_path), "%s.probs.npy", args.outbase);
+
+  NpyArrayI32* ref_tokens = npy_load_int32(ids_path);
+  NpyArray* ref_logits = npy_load_float32(logits_path);
+  NpyArray* ref_probs = npy_load_float32(probs_path);
+  if (!ref_tokens || !ref_logits || !ref_probs) {
+    fprintf(stderr, "Missing ids/logits/probs dumps\n"); return 1;
+  }
+
+  const int seq_len = ref_tokens->shape[0];
+  const int vocab_size = config.vocab_size;
+
+  if (ref_logits->shape[1] != vocab_size || ref_probs->shape[1] != vocab_size) {
+    fprintf(stderr, "Vocab mismatch: vocab_size=%d vs dumps [%d,%d]\n",
+            vocab_size, (int)ref_logits->shape[1], (int)ref_probs->shape[1]);
     return 1;
   }
-  const char* allfile = argv[1];
-  const char* outbase = argv[2];
-  int steps = atoi(argv[3]);
 
-  // load weights
-  BinFile* bf = bin_load(allfile);
-  if (!bf){ fprintf(stderr,"bin load fail\n"); return 1; }
+  // Resolve prompt length and steps based on presence of --prompt_len
+  // If not specified, assume generation starts after the first token
+  int prompt_len = args.prompt_len_opt
+                   ? args.prompt_len
+                   : (seq_len - args.steps);
 
-  QwenConfig cfg; QwenWeights w;
-  load_all_weights(bf, &cfg, &w);
-  printf("[model] d_model=%d n_layers=%d head_dim=%d n_q=%d n_kv=%d vocab=%d\n",
-         cfg.d_model, cfg.n_layers, cfg.head_dim, cfg.n_q, cfg.n_kv, cfg.vocab_size);
+  if (prompt_len < 1) prompt_len = 1;
+  if (prompt_len > seq_len) prompt_len = seq_len;
+  int steps = args.steps;
+  if (steps < 1) steps = 1;
+  if (steps > seq_len - prompt_len) steps = seq_len - prompt_len;
 
-  // load reference ids/logits/probs
-  char ipath[512], lpath[512], ppath[512];
-  snprintf(ipath,sizeof(ipath),"%s.ids.npy", outbase);
-  snprintf(lpath,sizeof(lpath),"%s.logits.npy", outbase);
-  snprintf(ppath,sizeof(ppath),"%s.probs.npy",  outbase);
-
-  NpyArrayI32* IDS = npy_load_int32(ipath);
-  NpyArray* LREF   = npy_load_float32(lpath);
-  NpyArray* PREF   = npy_load_float32(ppath);
-  if (!IDS || !LREF || !PREF) { fprintf(stderr,"missing ids/logits/probs dumps\n"); return 1; }
-
-  // steps sanity
-  if (LREF->shape[0] < steps || PREF->shape[0] < steps) {
-    fprintf(stderr,"steps=%d exceeds dump steps (%d)\n", steps, (int)LREF->shape[0]); return 1;
-  }
-  const int V = cfg.vocab_size;
-  if (LREF->shape[1] != V || PREF->shape[1] != V) {
-    fprintf(stderr,"vocab mismatch: V=%d vs dumps [%d,%d]\n", V, (int)LREF->shape[1], (int)PREF->shape[1]); return 1;
+  if (steps <= 0) {
+    fprintf(stderr, "Nothing to generate: prompt_len=%d covers all %d tokens.\n", prompt_len, seq_len);
+    return 1;
   }
 
-  // run step-by-step
-  int T0 = IDS->shape[0] - steps;           // initial prompt length
-  if (T0 <= 0) T0 = 1;                      // verify_greedy default
-  float* out_last = (float*)malloc(sizeof(float)*V);
+  // The reference logits/probs are assumed to cover predictions starting from position 1 to seq_len-1
+  // We need at least (prompt_len - 1 + steps) reference entries
+  const int required_refs = prompt_len - 1 + steps;
+  if (ref_logits->shape[0] < required_refs || ref_probs->shape[0] < required_refs) {
+    fprintf(stderr, "steps=%d with prompt_len=%d requires %d refs, but dumps have only %d\n",
+            steps, prompt_len, required_refs, (int)ref_logits->shape[0]);
+    return 1;
+  }
 
-  for (int s=0; s<steps; ++s) {
-    int T = T0 + s;
-    // run forward on the prefix ids[:T]
+  printf("[run] seq_len=%d prompt_len=%d steps=%d\n", seq_len, prompt_len, steps);
+
+  float* last_logits = (float*)malloc(sizeof(float) * vocab_size);
+
+  for (int step = 0; step < steps; ++step) {
+    // Compute the current input length: prompt + previously "generated" tokens (from reference)
+    int input_len = prompt_len + step;
+
+    // Run model forward on the prefix tokens[0..input_len-1], get logits for the next token
     model_forward_f32(
-      IDS->data, T,
-      &cfg, &w,
+      ref_tokens->data, input_len,
+      &config, &weights,
       /*apply_softmax=*/0,
-      out_last
+      last_logits
     );
 
-    // compare logits last row vs ref
-    double mad_logits = max_abs_diff(out_last, &LREF->data[(size_t)s*V], V);
+    // The reference index: references start from predicting token 1 (LREF[0]),
+    // so for predicting token (prompt_len + step), the ref index is (prompt_len + step - 1)
+    int ref_index = prompt_len - 1 + step;
 
-    // softmax and compare probs
-    softmax_rows(out_last, 1, V);
-    double mad_probs  = max_abs_diff(out_last, &PREF->data[(size_t)s*V], V);
+    // Compare logits to the corresponding reference
+    double max_abs_diff_logits = max_abs_diff(last_logits, &ref_logits->data[(size_t)ref_index * vocab_size], vocab_size);
 
-    // argmax both
-    int a_c = 0, a_r = 0; float mv_c = out_last[0], mv_r = PREF->data[(size_t)s*V+0];
-    for (int i=1;i<V;++i){ if(out_last[i]>mv_c){mv_c=out_last[i]; a_c=i;} if(PREF->data[(size_t)s*V+i]>mv_r){mv_r=PREF->data[(size_t)s*V+i]; a_r=i;} }
+    // Softmax the model logits and compare probs to reference
+    softmax_rows(last_logits, 1, vocab_size);
+    double max_abs_diff_probs = max_abs_diff(last_logits, &ref_probs->data[(size_t)ref_index * vocab_size], vocab_size);
+
+    // Compute argmax for model and reference
+    int argmax_model = 0, argmax_ref = 0;
+    float max_prob_model = last_logits[0];
+    float max_prob_ref = ref_probs->data[(size_t)ref_index * vocab_size + 0];
+    for (int i = 1; i < vocab_size; ++i) {
+      if (last_logits[i] > max_prob_model) { max_prob_model = last_logits[i]; argmax_model = i; }
+      float ref_val = ref_probs->data[(size_t)ref_index * vocab_size + i];
+      if (ref_val > max_prob_ref) { max_prob_ref = ref_val; argmax_ref = i; }
+    }
 
     printf("[step %d] logits MAD=%.8g  probs MAD=%.8g  argmax=%d  ref=%d\n",
-           s, mad_logits, mad_probs, a_c, a_r);
+           step, max_abs_diff_logits, max_abs_diff_probs, argmax_model, argmax_ref);
   }
 
-  free(out_last);
-  npy_free_i32(IDS); npy_free(LREF); npy_free(PREF);
+  free(last_logits);
+  npy_free_i32(ref_tokens);
+  npy_free(ref_logits);
+  npy_free(ref_probs);
 
-  // free layer expert arrays
-  for (int L=0; L<cfg.n_layers; ++L) {
-    free((void*)w.layers[L].Wg);
-    free((void*)w.layers[L].Wu);
-    free((void*)w.layers[L].Wd);
+  // Free layer expert arrays
+  for (int layer = 0; layer < config.n_layers; ++layer) {
+    free((void*)weights.layers[layer].Wg);
+    free((void*)weights.layers[layer].Wu);
+    free((void*)weights.layers[layer].Wd);
   }
-  free(w.layers);
-  bin_free(bf);
+  free(weights.layers);
+  bin_free(bin_file);
   return 0;
 }
