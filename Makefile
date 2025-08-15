@@ -4,7 +4,7 @@ CFLAGS = -g -O2 -Wall #-DDEBUG -DBENCH
 
 OBJS = io.o utils.o kernels.o
 
-all: test_embed test_head test_layer_trace test_model_trace test_expert test_moe_block test_rmsnorm test_attn test_rope list_bin
+all: test_embed test_head test_layer_trace test_model_trace test_expert test_moe_block test_rmsnorm test_attn test_rope list_bin tokenizer_test tokenizer_demo
 
 test_expert: test_expert.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -48,8 +48,20 @@ test_model_trace: test_model_trace.o io.o utils.o
 list_bin: list_bin.o io.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+# Tokenizer targets
+tokenizer_test: tokenizer_test.o tokenizer.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+tokenizer_demo: tokenizer_demo.o tokenizer.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+# Export tokenizer from Qwen3 model
+export_tokenizer:
+	python3 export_qwen3_tokenizer.py
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	$(RM) -f *.o test_expert test_moe_block
+	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo
+	$(RM) -f qwen3_tokenizer.bin qwen3_tokenizer_meta.json
