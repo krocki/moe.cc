@@ -36,6 +36,27 @@
 #include "io.h"     // bin_load / bin_find / npy_load_* already available
 #include "utils.h"  // max_abs_diff, etc.
 
+#ifdef DEBUG
+  #define DBG(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
+#else
+  #define DBG(...)
+#endif
+
+#ifdef BENCH
+  #define TIMER_DECL struct timespec __t0, __t1
+  #define TIMER_START() clock_gettime(CLOCK_MONOTONIC, &__t0)
+  #define TIMER_END_MS(ms_out) do { \
+      clock_gettime(CLOCK_MONOTONIC, &__t1); \
+      double __ms = (__t1.tv_sec - __t0.tv_sec) * 1000.0 + \
+                    (__t1.tv_nsec - __t0.tv_nsec) / 1.0e6; \
+      (ms_out) = __ms; \
+    } while(0)
+#else
+  #define TIMER_DECL
+  #define TIMER_START()     do{}while(0)
+  #define TIMER_END_MS(x)   do{ (void)(x); }while(0)
+#endif
+
 //==============================
 // Toggle profiling on/off here
 //==============================
@@ -669,6 +690,15 @@ int main(int argc, char** argv) {
     // Compute the current input length: prompt + previously "generated" tokens (from reference)
     int input_len = prompt_len + step;
 
+    #ifdef BENCH
+      double ms = 0.0;
+    #endif
+      DBG("[model_forward_f32] step=%d\n ", step);
+    #ifdef BENCH
+      TIMER_DECL;
+      TIMER_START();
+    #endif
+
     // Run model forward on the prefix tokens[0..input_len-1], get logits for the next token
     model_forward_f32(
       ref_tokens->data, input_len,
@@ -700,6 +730,12 @@ int main(int argc, char** argv) {
 
     printf("[step %d] logits MAD=%.8g  probs MAD=%.8g  argmax=%d  ref=%d\n",
            step, max_abs_diff_logits, max_abs_diff_probs, argmax_model, argmax_ref);
+    TIMER_END_MS(ms);
+    #ifdef BENCH
+      DBG("[model_forward] done in %.3f ms, %.3f t/s\n", ms, 1e3 / ms);
+    #else
+      DBG("[model_forward] done\n");
+    #endif
   }
 
   free(last_logits);
@@ -717,3 +753,4 @@ int main(int argc, char** argv) {
   bin_free(bin_file);
   return 0;
 }
+
