@@ -13,6 +13,7 @@ def _save_tensor(f, name, t):
   if   t.dtype == torch.float32: dt = 0
   elif t.dtype == torch.float16: dt = 1
   elif t.dtype == torch.int8:    dt = 2
+  elif t.dtype == torch.uint8:   dt = 3
   else: raise ValueError(f"dtype {t.dtype} not supported")
   f.write(struct.pack("<I", dt))
   f.write(struct.pack("<I", t.dim()))
@@ -37,6 +38,20 @@ def _rowwise_q4(w):  # pack 2x int4 per byte
 def _is_norm_key(k: str) -> bool:
   # Qwen3: input_layernorm / post_attention_layernorm or rms_1 / rms_2
   return (".layernorm" in k) or (".rms_1" in k) or (".rms_2" in k) or k.endswith(".norm.weight")
+
+def _is_expert_weight(k: str) -> bool:
+  """Check if tensor is an expert weight matrix that should be quantized."""
+  return (".experts." in k and 
+          (k.endswith(".gate_proj.weight") or 
+           k.endswith(".up_proj.weight") or 
+           k.endswith(".down_proj.weight")))
+
+def _should_quantize(k: str, args) -> bool:
+  """Determine if a tensor should be quantized based on name and args."""
+  if args.quant == "none":
+    return False
+  # Only quantize 2D expert weight matrices
+  return _is_expert_weight(k)
 
 def iter_subset(sd, args):
   # whole model
@@ -136,7 +151,11 @@ def main():
       with open(path, "wb") as f:
         f.write(MAGIC)
         f.write(struct.pack("<I", 1))  # one tensor per file
-        if args.quant == "none" or t.dim() != 2:
+        
+        # Selective quantization: only quantize 2D expert weight matrices
+        should_quant = _should_quantize(name, args) and t.dim() == 2
+        
+        if not should_quant:
           _save_tensor(f, name, t.float())
           qinfo = None
         else:
@@ -145,18 +164,19 @@ def main():
             _save_tensor(f, name+".scale", s)
             _save_tensor(f, name+".q8", q)
             qinfo = {"scheme":"rowwise_q8"}
-          else:
+          else:  # q4
             s,q = _rowwise_q4(t)
             _save_tensor(f, name+".scale", s)
             _save_tensor(f, name+".q4", q)
             qinfo = {"scheme":"rowwise_q4"}
+      
       # keep a light index
       shp = tuple(int(x) for x in t.shape)
       manifest["tensors"].append({
         "name": name,
         "file": os.path.basename(path),
         "shape": shp,
-        "dtype": "f32" if args.quant=="none" else "quant",
+        "dtype": "f32" if not should_quant else "quant",
         "quant": qinfo
       })
 
@@ -170,7 +190,10 @@ def main():
     f.write(MAGIC)
     f.write(struct.pack("<I", len(selected)))
     for name, t in selected:
-      if args.quant == "none" or t.dim() != 2:
+      # Selective quantization: only quantize 2D expert weight matrices
+      should_quant = _should_quantize(name, args) and t.dim() == 2
+      
+      if not should_quant:
         _save_tensor(f, name, t.float())
       else:
         if args.quant == "q8":

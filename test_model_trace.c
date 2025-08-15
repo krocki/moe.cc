@@ -35,6 +35,7 @@
 #include "model.h"
 #include "io.h"     // bin_load / bin_find / npy_load_* already available
 #include "utils.h"  // max_abs_diff, etc.
+#include "kernels.h" // matmul_adaptive for quantized weights
 
 #ifdef DEBUG
   #define DBG(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
@@ -488,11 +489,27 @@ static void layer_forward_f32(
     for (int i=0;i<top_k;++i){
       int e = tmp_idx[i];
       float p = tmp_val[i];
-      matmul_f32(&x_norm2[(size_t)t*d_model], lw->Wg[e], tmp_g, 1, d_ff, d_model);
-      silu_f32(tmp_g, d_ff);
-      matmul_f32(&x_norm2[(size_t)t*d_model], lw->Wu[e], tmp_u, 1, d_ff, d_model);
-      for (int q=0;q<d_ff;++q) tmp_g[q] *= tmp_u[q];
-      matmul_f32(tmp_g, lw->Wd[e], tmp_y, 1, d_model, d_ff);
+      
+      // Use adaptive matrix multiplication for expert weights
+      if (lw->experts_quantized) {
+        // Quantized expert forward pass
+        matmul_adaptive(&x_norm2[(size_t)t*d_model], NULL, &lw->Wg_q[e], 
+                       tmp_g, 1, d_ff, d_model);
+        silu_f32(tmp_g, d_ff);
+        matmul_adaptive(&x_norm2[(size_t)t*d_model], NULL, &lw->Wu_q[e],
+                       tmp_u, 1, d_ff, d_model);
+        for (int q=0;q<d_ff;++q) tmp_g[q] *= tmp_u[q];
+        matmul_adaptive(tmp_g, NULL, &lw->Wd_q[e],
+                       tmp_y, 1, d_model, d_ff);
+      } else {
+        // Original FP32 expert forward pass
+        matmul_f32(&x_norm2[(size_t)t*d_model], lw->Wg[e], tmp_g, 1, d_ff, d_model);
+        silu_f32(tmp_g, d_ff);
+        matmul_f32(&x_norm2[(size_t)t*d_model], lw->Wu[e], tmp_u, 1, d_ff, d_model);
+        for (int q=0;q<d_ff;++q) tmp_g[q] *= tmp_u[q];
+        matmul_f32(tmp_g, lw->Wd[e], tmp_y, 1, d_model, d_ff);
+      }
+      
       for (int q=0;q<d_model;++q) moe_out[(size_t)t*d_model + q] += p * tmp_y[q];
     }
   }

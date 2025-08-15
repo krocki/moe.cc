@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "io.h"
 
 typedef struct {
@@ -21,24 +22,39 @@ typedef struct {
   float rms_eps;
 } QwenConfig;
 
+// Quantized weight structure for expert matrices
 typedef struct {
-  // attention
+  const int8_t* q;      // quantized weights
+  const float* s;       // scales (per row)
+  int rows, cols;       // dimensions
+  int dtype;            // 2=q8, 3=q4 (matches TensorBin dtypes)
+} QuantizedWeight;
+#define QUANTIZED_WEIGHT_DEFINED
+
+typedef struct {
+  // attention (always FP32)
   const float* Wq; const float* bq;
   const float* Wk; const float* bk;
   const float* Wv; const float* bv;
   const float* Wo; const float* bo;
   const float* q_norm; // length = head_dim
   const float* k_norm; // length = head_dim
-  // norms
+  // norms (always FP32)
   const float* rms1_w;
   const float* rms2_w;
-  // router
+  // router (always FP32)
   const float* router_w; // [E, d_model]
   const float* router_b; // [E] or NULL
-  // experts (arrays of E pointers; bias pointers may be NULL)
+  // experts: can be FP32 or quantized
+  // FP32 pointers (NULL if quantized)
   const float** Wg; const float** bg; // [E][d_ff, d_model], [E][d_ff]
   const float** Wu; const float** bu; // [E][d_ff, d_model], [E][d_ff]
   const float** Wd; const float** bd; // [E][d_model, d_ff], [E][d_model]
+  // Quantized versions (valid if corresponding FP32 pointer is NULL)
+  QuantizedWeight* Wg_q; // [E] array of quantized gate weights
+  QuantizedWeight* Wu_q; // [E] array of quantized up weights  
+  QuantizedWeight* Wd_q; // [E] array of quantized down weights
+  int experts_quantized; // 0=fp32, 1=quantized
 } QwenLayerWeights;
 
 typedef struct {
@@ -63,6 +79,28 @@ static TensorBin* need(BinFile* b, const char* k){
   return t;
 }
 static TensorBin* maybe(BinFile* b, const char* k){ return bin_find(b,k); }
+
+// Helper function to find a tensor, prioritizing the original name
+static TensorBin* need_adaptive(BinFile* b, const char* k) {
+  TensorBin* t = bin_find(b, k);
+  if (t) return t;
+  
+  // If original tensor not found, it might be quantized
+  // This happens when we're loading a quantized model but still looking for original names
+  char q8_name[512], q4_name[512];
+  snprintf(q8_name, sizeof(q8_name), "%s.q8", k);
+  snprintf(q4_name, sizeof(q4_name), "%s.q4", k);
+  
+  t = bin_find(b, q8_name);
+  if (t) return t;  // Found Q8 version
+  
+  t = bin_find(b, q4_name);
+  if (t) return t;  // Found Q4 version
+  
+  // Still not found - this is an error
+  fprintf(stderr, "missing %s (tried fp32, q8, q4)\n", k);
+  exit(1);
+}
 
 // Fill QwenWeights/QwenConfig from all.bin (Qwen/Qwen3-30B-A3B layout).
 // Only strings appear here (one-time), never inside the forward loops.
@@ -92,14 +130,27 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
   }
 
   // MoE sizes
-  // infer n_experts and d_ff from first layer’s experts
+  // infer n_experts and d_ff from first layer's experts
   int E = 0, d_ff = -1;
   for (;;) {
     char k_down[256];
     snprintf(k_down,sizeof(k_down),"model.layers.0.mlp.experts.%d.down_proj.weight", E);
     TensorBin* t = bin_find(bf,k_down);
+    
+    // If FP32 version not found, try quantized versions
+    if (!t) {
+      snprintf(k_down,sizeof(k_down),"model.layers.0.mlp.experts.%d.down_proj.weight.q8", E);
+      t = bin_find(bf,k_down);
+    }
+    if (!t) {
+      snprintf(k_down,sizeof(k_down),"model.layers.0.mlp.experts.%d.down_proj.weight.q4", E);
+      t = bin_find(bf,k_down);
+    }
+    
     if (!t) break;
     d_ff = t->shape[1];
+    // For Q4, shape[1] is packed (2 values per byte), so actual cols is shape[1] * 2
+    if (strstr(k_down, ".q4")) d_ff *= 2;
     E++;
   }
   if (E==0 || d_ff<=0) { fprintf(stderr,"infer MoE sizes failed\n"); exit(1); }
@@ -166,17 +217,107 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
     TensorBin* RB = maybe(bf, (snprintf(k,sizeof(k),"model.layers.%d.mlp.gate.bias",L), k));
     lw->router_b = (RB && RB->dtype==0) ? (const float*)RB->data : NULL;
 
-    // experts arrays
-    lw->Wg = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
-    lw->Wu = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
-    lw->Wd = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
-    for (int e=0;e<cfg->n_experts;++e){
-      snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight",L,e);
-      lw->Wg[e] = (const float*)need(bf,k)->data;
-      snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight",L,e);
-      lw->Wu[e] = (const float*)need(bf,k)->data;
-      snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight",L,e);
-      lw->Wd[e] = (const float*)need(bf,k)->data;
+    // Check if experts are quantized by looking for .q8/.q4 suffixes
+    snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.0.gate_proj.weight.q8",L);
+    TensorBin* test_q8 = maybe(bf, k);
+    snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.0.gate_proj.weight.q4",L);
+    TensorBin* test_q4 = maybe(bf, k);
+    
+    lw->experts_quantized = (test_q8 || test_q4) ? 1 : 0;
+    
+    if (lw->experts_quantized) {
+      // Allocate quantized weight structures
+      lw->Wg_q = (QuantizedWeight*)calloc((size_t)cfg->n_experts, sizeof(QuantizedWeight));
+      lw->Wu_q = (QuantizedWeight*)calloc((size_t)cfg->n_experts, sizeof(QuantizedWeight));
+      lw->Wd_q = (QuantizedWeight*)calloc((size_t)cfg->n_experts, sizeof(QuantizedWeight));
+      lw->Wg = lw->Wu = lw->Wd = NULL; // Mark FP32 as unused
+      
+      // Load quantized expert weights
+      for (int e=0; e<cfg->n_experts; ++e){
+        // Gate projection
+        if (test_q8) {
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.q8",L,e);
+          TensorBin* q_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.scale",L,e);
+          TensorBin* s_data = need(bf,k);
+          lw->Wg_q[e].q = (const int8_t*)q_data->data;
+          lw->Wg_q[e].s = (const float*)s_data->data;
+          lw->Wg_q[e].rows = q_data->shape[0];
+          lw->Wg_q[e].cols = q_data->shape[1];
+          lw->Wg_q[e].dtype = 2; // q8
+        } else {
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.q4",L,e);
+          TensorBin* q_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.scale",L,e);
+          TensorBin* s_data = need(bf,k);
+          lw->Wg_q[e].q = (const int8_t*)q_data->data;
+          lw->Wg_q[e].s = (const float*)s_data->data;
+          lw->Wg_q[e].rows = q_data->shape[0];
+          lw->Wg_q[e].cols = q_data->shape[1] * 2; // q4 packs 2 values per byte
+          lw->Wg_q[e].dtype = 3; // q4
+        }
+        
+        // Up projection  
+        if (test_q8) {
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.q8",L,e);
+          TensorBin* q_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.scale",L,e);
+          TensorBin* s_data = need(bf,k);
+          lw->Wu_q[e].q = (const int8_t*)q_data->data;
+          lw->Wu_q[e].s = (const float*)s_data->data;
+          lw->Wu_q[e].rows = q_data->shape[0];
+          lw->Wu_q[e].cols = q_data->shape[1];
+          lw->Wu_q[e].dtype = 2;
+        } else {
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.q4",L,e);
+          TensorBin* q_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.scale",L,e);
+          TensorBin* s_data = need(bf,k);
+          lw->Wu_q[e].q = (const int8_t*)q_data->data;
+          lw->Wu_q[e].s = (const float*)s_data->data;
+          lw->Wu_q[e].rows = q_data->shape[0];
+          lw->Wu_q[e].cols = q_data->shape[1] * 2;
+          lw->Wu_q[e].dtype = 3;
+        }
+        
+        // Down projection
+        if (test_q8) {
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.q8",L,e);
+          TensorBin* q_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.scale",L,e);
+          TensorBin* s_data = need(bf,k);
+          lw->Wd_q[e].q = (const int8_t*)q_data->data;
+          lw->Wd_q[e].s = (const float*)s_data->data;
+          lw->Wd_q[e].rows = q_data->shape[0];
+          lw->Wd_q[e].cols = q_data->shape[1];
+          lw->Wd_q[e].dtype = 2;
+        } else {
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.q4",L,e);
+          TensorBin* q_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.scale",L,e);
+          TensorBin* s_data = need(bf,k);
+          lw->Wd_q[e].q = (const int8_t*)q_data->data;
+          lw->Wd_q[e].s = (const float*)s_data->data;
+          lw->Wd_q[e].rows = q_data->shape[0];
+          lw->Wd_q[e].cols = q_data->shape[1] * 2;
+          lw->Wd_q[e].dtype = 3;
+        }
+      }
+    } else {
+      // Load FP32 expert weights (original behavior)
+      lw->Wg = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
+      lw->Wu = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
+      lw->Wd = (const float**)calloc((size_t)cfg->n_experts, sizeof(float*));
+      lw->Wg_q = lw->Wu_q = lw->Wd_q = NULL; // Mark quantized as unused
+      
+      for (int e=0;e<cfg->n_experts;++e){
+        snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight",L,e);
+        lw->Wg[e] = (const float*)need(bf,k)->data;
+        snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight",L,e);
+        lw->Wu[e] = (const float*)need(bf,k)->data;
+        snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight",L,e);
+        lw->Wd[e] = (const float*)need(bf,k)->data;
+      }
     }
   }
 }

@@ -152,11 +152,11 @@ static void progress_draw(size_t done_bytes, size_t total_bytes, size_t loaded, 
     }
 
     // Line 1
-    fprintf(stderr, "\x1b[2K\rLoading tensors [%s] (%zu/%zu) %3d%% %.2f GiB/s  (%.2f/%.2f GiB)  ETA %s\n",
-            bar, loaded, total_tensors, pct, speed, done_gib, total_gib, etabuf);
+    fprintf(stderr, "\x1b[2K\rLoading tensors [%s] %3d%% %.2f GiB/s  (%.2f/%.2f GiB)  ETA %s\n",
+            bar, pct, speed, done_gib, total_gib, etabuf);
 
     // Line 2
-    fprintf(stderr, "\x1b[2K\r%s%s ",
+    fprintf(stderr, "\x1b[2K\r%8zu %s%s ", loaded,
             shown[0] ? "" : "tensor(s) ", shown);
 
 }
@@ -210,10 +210,17 @@ BinFile* bin_load(const char* path){
   }
 
   uint32_t nt = read_u32(f);
-  g_tensor_total = nt; g_tensor_loaded = 0;
+  // Note: nt is the original tensor count, but file may contain more entries
+  // when some tensors are quantized (each becomes 2 entries: .q8/.q4 + .scale)
+  // So we'll grow the array dynamically and count actual entries loaded
+  
   BinFile* bf = (BinFile*)xmalloc(sizeof(BinFile));
-  bf->count = (int)nt;
-  bf->arr   = (TensorBin*)xmalloc(sizeof(TensorBin)*nt);
+  bf->count = 0;  // Start with 0, increment as we load
+  size_t capacity = nt * 2; // Initial capacity (assumes some quantization)
+  bf->arr = (TensorBin*)xmalloc(sizeof(TensorBin)*capacity);
+  
+  g_tensor_total = 0; // Will be updated as we discover actual count
+  g_tensor_loaded = 0;
 
   // initial progress snapshot (after header)
   if (total_bytes){
@@ -221,10 +228,21 @@ BinFile* bin_load(const char* path){
     progress_draw(done, total_bytes, g_tensor_loaded, g_tensor_total, "");
   }
 
-  for (uint32_t i=0;i<nt;i++){
-    TensorBin* t = &bf->arr[i];
-
-    uint32_t name_len = read_u32(f);
+  // Load tensors until EOF (dynamic count due to quantization)
+  while (!feof(f)) {
+    // Check if we need to grow the array
+    if ((size_t)bf->count >= capacity) {
+      capacity *= 2;
+      bf->arr = (TensorBin*)realloc(bf->arr, sizeof(TensorBin)*capacity);
+      if (!bf->arr) { fprintf(stderr, "Failed to resize tensor array\n"); exit(1); }
+    }
+    
+    TensorBin* t = &bf->arr[bf->count];
+    
+    // Try to read name length - if EOF, we're done
+    uint32_t name_len;
+    if (fread(&name_len, sizeof(uint32_t), 1, f) != 1) break;
+    
     t->name = (char*)xmalloc(name_len+1);
     read_exact(f, t->name, name_len);
     t->name[name_len] = 0;
@@ -252,13 +270,15 @@ BinFile* bin_load(const char* path){
     t->data   = xmalloc(t->nbytes);
     read_exact(f, t->data, t->nbytes);
 
-    // stats
+    // Increment count and stats
+    bf->count++;
     g_tensor_loaded++;
+    g_tensor_total = bf->count; // Update total as we discover entries
     if (t->dtype>=0 && t->dtype<4){ g_dtype_counts[t->dtype]++; g_dtype_bytes[t->dtype]+=t->nbytes; }
     add_group_stat(t->dtype, t->ndim, t->shape, t->nbytes);
     if (strcasestr_contains(t->name, "rms")) g_rms_count++;
 
-if (total_bytes){
+    if (total_bytes){
       size_t done = (size_t)ftell(f);
       progress_draw(done, total_bytes, g_tensor_loaded, g_tensor_total, t->name);
     }

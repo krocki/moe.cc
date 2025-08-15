@@ -2,11 +2,11 @@
 CC = gcc
 CFLAGS = -g -O2 -Wall -DDEBUG -DBENCH
 
-OBJS = io.o utils.o kernels.o
+OBJS = io.o utils.o
 
-all: test_model_trace tokenizer_demo tokenizer_test
+all: list_bin test_model_trace tokenizer_demo tokenizer_test
 
-test_model_trace: test_model_trace.o io.o utils.o
+test_model_trace: test_model_trace.o io.o utils.o kernels.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # Export tokenizer from Qwen3 model
@@ -22,10 +22,6 @@ tokenizer_test: tokenizer_test.o tokenizer.o
 
 tokenizer_demo: tokenizer_demo.o tokenizer.o
 	$(CC) $(CFLAGS) -o $@ $^
-
-# Export tokenizer from Qwen3 model
-export_tokenizer:
-	python3 export_qwen3_tokenizer.py
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
