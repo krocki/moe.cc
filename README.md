@@ -33,7 +33,21 @@ python3 export.py --model Qwen/Qwen3-30B-A3B --all --quant none --outdir qwen3-3
 python3 merge_dir.py all.bin qwen3-30b-a3_f32
 ```
 
+Export python I/O reference:
+```
+python verify_greedy.py \
+  --model Qwen/Qwen3-30B-A3B \
+  --layers 48 \
+  --seqlen 1 \
+  --steps 4 \
+  --qk-norm auto \
+  --rope-theta 10000000 \
+  --outbase q3_trace \
+  --first-id 151644 \
+  --force-f32
+
+```
 Run test:
 ```
-./test_model_trace all.bin q3_trace --steps 2 --prompt_len 1
+./test_model_trace all.bin q3_trace --steps 4 --prompt_len 1
 ```
