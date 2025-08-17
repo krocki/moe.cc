@@ -1,6 +1,6 @@
 # Qwen3 MoE (C) — Quantized MoE Inference Engine
 
-A high-performance C implementation for Qwen3-30B-A3B MoE inference with quantized expert weights:
+A C implementation for Qwen3-30B-A3B MoE inference with quantized expert weights:
 
 ## Key Features
 - **Quantized Expert Weights**: 8-bit (Q8) and 4-bit (Q4) quantization for MoE expert matrices
