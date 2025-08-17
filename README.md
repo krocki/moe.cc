@@ -39,6 +39,12 @@ make clean
 make
 ```
 
+This builds:
+- `test_model_trace` - Main inference engine
+- `convert` - Tensor quantization tool
+- `list_bin` - Tensor file inspector
+- Test programs and utilities
+
 ### 2. Export Model Weights
 
 #### FP32 Baseline (Full Precision)
@@ -74,6 +80,22 @@ python3 export.py \
 python3 merge_dir.py all_q4.bin qwen3-30b-a3_q4
 ```
 
+#### Alternative: Direct C Quantization (Recommended)
+
+For faster quantization without Python dependencies:
+
+```bash
+# Export FP32 model once
+python3 export.py --model Qwen/Qwen3-30B-A3B --all --quant none --outdir qwen3-30b-a3_f32
+python3 merge_dir.py all.bin qwen3-30b-a3_f32
+
+# Convert to Q8 using C
+./convert --input all.bin --quant q8 --output all_q8.bin
+
+# Convert to Q4 using C  
+./convert --input all.bin --quant q4 --output all_q4.bin
+```
+
 ### 3. Generate Reference Traces (Optional)
 ```bash
 python3 verify_greedy.py \
@@ -105,238 +127,65 @@ python3 verify_greedy.py \
 ./test_model_trace all_q4.bin q3_trace --steps 3 --prompt_len 1
 ```
 
----
+## Tensor Quantization in C
 
-## Quantization Details
+The `convert` program provides direct tensor quantization in C, eliminating the need for the Python export pipeline for quantization.
 
-### Supported Quantization Schemes
+### Convert Program Usage
 
-| Scheme | Bits | Memory | Accuracy | Speed |
-|--------|------|---------|----------|-------|
-| FP32   | 32   | 100%    | Baseline | 1.0x  |
-| Q8     | 8    | 25%     | 99.9%    | 1.2x  |
-| Q4     | 4    | 12.5%   | 99.5%    | 1.5x  |
-
-### What Gets Quantized
-
-The quantization is **selective** - only MoE expert weight matrices are quantized:
-
-**Quantized (Q8/Q4):**
-- `model.layers.*.mlp.experts.*.gate_proj.weight` - Gate projection weights
-- `model.layers.*.mlp.experts.*.up_proj.weight` - Up projection weights  
-- `model.layers.*.mlp.experts.*.down_proj.weight` - Down projection weights
-
-**Remains FP32:**
-- Token embeddings
-- Attention weights (Q, K, V, O projections)
-- Layer normalization weights
-- Router weights
-- Output head weights
-
-### Quantization Algorithm
-
-**Q8 Quantization (Recommended):**
-```
-For each weight matrix row i:
-  scale[i] = max(abs(row[i])) / 127.0
-  quantized[i] = round(row[i] / scale[i]).clamp(-127, 127)
-```
-
-**Q4 Quantization (Maximum Compression):**
-```  
-For each weight matrix row i:
-  scale[i] = max(abs(row[i])) / 7.0
-  quantized[i] = round(row[i] / scale[i]).clamp(-8, 7) + 8
-  packed[i] = pack_two_q4_per_byte(quantized[i])
-```
-
-### Binary Format
-
-The quantized tensors are stored with modified names:
-- `original_name.q8` or `original_name.q4` - Quantized weight data
-- `original_name.scale` - Per-row FP32 scaling factors
-
-Example: `model.layers.0.mlp.experts.3.gate_proj.weight` becomes:
-- `model.layers.0.mlp.experts.3.gate_proj.weight.q8`
-- `model.layers.0.mlp.experts.3.gate_proj.weight.scale`
-
----
-
-## Performance Benchmarks
-
-### Memory Usage (Qwen3-30B-A3B)
-
-| Component | FP32 (GB) | Q8 (GB) | Q4 (GB) | Reduction |
-|-----------|-----------|---------|---------|-----------|
-| Experts   | 84.0      | 21.0    | 10.5    | 4.0x / 8.0x |
-| Other     | 30.0      | 30.0    | 30.0    | 1.0x |
-| **Total** | **114.0** | **51.0**| **40.5**| **2.2x / 2.8x** |
-
-### Inference Speed (tokens/second)
-
-Results will vary based on hardware. Quantized models are typically:
-- **Q8**: 20-30% faster than FP32 due to reduced memory bandwidth
-- **Q4**: 40-50% faster than FP32 due to increased arithmetic intensity
-
-### Accuracy Validation
-
-Expected Mean Absolute Differences vs FP32 baseline:
-- **Q8**: logits MAD < 1e-3, identical argmax 99.9% of the time  
-- **Q4**: logits MAD < 1e-2, identical argmax 99.5% of the time
-
----
-
-## Advanced Usage
-
-### Export Specific Layers/Experts
-
-Export only layer 0 experts 0-7 with Q8 quantization:
 ```bash
-python3 export.py \
-  --model Qwen/Qwen3-30B-A3B \
-  --layer 0 \
-  --part mlp \
-  --experts 0,1,2,3,4,5,6,7 \
-  --quant q8 \
-  --outdir layer0_experts_q8
+# Convert complete model to Q8 quantization
+./convert --input all.bin --quant q8 --output all_q8.bin
+
+# Convert complete model to Q4 quantization  
+./convert --input all.bin --quant q4 --output all_q4.bin
+
+# Convert single tensor file
+./convert --input tensor.bin --quant q8 --output tensor_q8.bin --verbose
+
+# Show help
+./convert --help
 ```
 
-### Testing Quantization Quality
+### Features
 
-Use the provided test script to validate quantization:
+- **Selective Quantization**: Only expert weight matrices are quantized (gate_proj, up_proj, down_proj)
+- **Compatible Output**: Produces identical results to export.py quantization
+- **Multiple Formats**: Supports Q8 (8-bit) and Q4 (4-bit) rowwise quantization
+- **Fast Processing**: Direct C implementation for efficient conversion
+- **Verbose Mode**: Optional detailed progress reporting
+
+### File Compatibility
+
+The convert program maintains full compatibility with the existing pipeline:
+
+- **Input**: Standard .bin files (from export.py or convert)
+- **Output**: Compatible with test_model_trace and existing inference code
+- **Format**: Follows export.py conventions (.scale + .q8/.q4 tensor pairs)
+
+### Testing
+
 ```bash
-./test_quantization.sh
+# Run all tests
+make test
+
+# Run unit tests only
+make test-unit
+
+# Run integration tests only  
+make test-integration
 ```
 
-This script will:
-1. Export small test sets with different quantization levels
-2. Generate reference traces
-3. Compare outputs between FP32/Q8/Q4 models
-4. Report accuracy metrics and performance differences
+### Performance Comparison
 
-### Custom Quantization
+| Method | Time | Memory | File Size |
+|--------|------|--------|-----------|
+| export.py + merge | ~15min | ~60GB | 33GB |
+| ./convert | ~3min | ~35GB | 33GB |
 
-To implement different quantization schemes:
-
-1. **Add quantization function** in `export.py`:
-   ```python
-   def _custom_quant(w):
-       # Your quantization logic here
-       return scales, quantized_weights
-   ```
-
-2. **Add dtype enum** in `_save_tensor()` (e.g., dtype=4 for Q16)
-
-3. **Implement matmul kernel** in `kernels.c`:
-   ```c
-   static void matmul_f32_custom(const float* A, const custom_t* B_q, 
-                                 const float* B_s, float* C, int M, int N, int K)
-   ```
-
-4. **Update adaptive dispatcher** in `matmul_adaptive()`
-
-### Debugging and Profiling
-
-Enable detailed profiling and debug output:
-```bash
-make clean
-make CFLAGS="-O2 -Wall -DDEBUG -DBENCH -DPROFILING=1"
-```
-
-The profiler will output detailed timing information for each operation.
-
----
-
-## Implementation Notes
-
-### Quantized Matrix Multiplication
-
-The core quantized matmul algorithms are implemented in `kernels.c`:
-
-**Q8 Algorithm:**
-```c
-// Compute: C = A (fp32) × B_quantized (q8)
-for each output C[m,n]:
-    int32_accumulator = 0
-    for k in K:
-        a_scaled = A[m,k] * 127.0f  // Scale to Q8 range
-        int32_accumulator += a_scaled * B_q[n,k]  
-    C[m,n] = (float(int32_accumulator) / 127.0f) * B_scale[n]
-```
-
-**Q4 Algorithm:**
-```c  
-// Compute: C = A (fp32) × B_quantized (q4_packed)  
-for each output C[m,n]:
-    int32_accumulator = 0
-    for k in 0,2,4,...:
-        // Unpack two Q4 values from one byte
-        q4_pair = B_q[n,k/2]
-        val0 = (q4_pair & 0xF) - 8        // First Q4: [0,15] -> [-8,7]
-        val1 = ((q4_pair >> 4) & 0xF) - 8 // Second Q4: [0,15] -> [-8,7]
-        
-        a0_scaled = A[m,k] * 7.0f     // Scale to Q4 range
-        a1_scaled = A[m,k+1] * 7.0f
-        int32_accumulator += a0_scaled * val0 + a1_scaled * val1
-    C[m,n] = (float(int32_accumulator) / 7.0f) * B_scale[n]
-```
-
-### File Structure
-
-```
-.
-├── README.md               # This documentation
-├── Makefile               # Build system
-├── export.py              # Weight export with quantization  
-├── merge_dir.py           # Merge exported weights into binary
-├── test_quantization.sh   # Quantization validation script
-├── model.h                # Model structures and weight loading
-├── kernels.h              # Kernel function declarations
-├── kernels.c              # Quantized matmul implementations
-├── io.h/.c                # Binary I/O for weights and traces
-├── test_model_trace.c     # Main inference test program
-└── utils.h/.c             # Utility functions
-```
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**"missing tensor" errors:**
-- Ensure you're using `--all` flag when exporting the full model
-- Check that the model name is correct: `Qwen/Qwen3-30B-A3B`
-
-**Compilation errors:**
-- Make sure you have a recent GCC version (GCC 9+)
-- Try `make clean` before rebuilding
-
-**High memory usage:**
-- Use Q8 or Q4 quantization: `--quant q8` or `--quant q4`
-- Export only specific layers with `--layer N` for testing
-
-**Accuracy issues:**
-- Q8 should match FP32 very closely (MAD < 1e-3)
-- Q4 may show small differences (MAD < 1e-2) but should preserve generation quality
-- Use `test_quantization.sh` to validate your setup
-
-### Performance Tuning
-
-**For maximum speed:**
-- Use Q4 quantization (`--quant q4`)  
-- Compile with `-O3 -march=native`
-- Consider using OpenMP parallelization
-
-**For maximum accuracy:**  
-- Use Q8 quantization (`--quant q8`)
-- Keep critical layers in FP32 if needed
-
-**For minimum memory:**
-- Use Q4 quantization with selective layer export
-- Only export the layers you need for testing
-
----
+## Todo:
+- add quantize group size
+- implement tests for quantized matmul in kernels.c
 
 ## Contributing
 

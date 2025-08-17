@@ -23,6 +23,14 @@ BinFile* bin_load(const char* path);
 void bin_free(BinFile* bf);
 TensorBin* bin_find(BinFile* bf, const char* name);
 
+// Additional functions for saving/writing tensors
+int bin_save(const BinFile* bf, const char* path);
+int bin_save_single_tensor(const TensorBin* tensor, const char* path);
+TensorBin* tensor_create(const char* name, int dtype, int ndim, const int* shape, const void* data);
+void tensor_free_single(TensorBin* tensor);
+BinFile* binfile_create(void);
+int binfile_add_tensor(BinFile* bf, const TensorBin* tensor);
+
 typedef struct {
   int    ndim;
   int*   shape;

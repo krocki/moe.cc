@@ -13,7 +13,7 @@
 // ---- progress state / stats ----
 static struct timespec g_progress_start;
 static int g_progress_started = 0;
-static size_t g_progress_total_bytes = 0;
+// static size_t g_progress_total_bytes = 0; // Unused variable
 static size_t g_tensor_total = 0;
 static size_t g_tensor_loaded = 0;
 
@@ -304,11 +304,9 @@ for (int d=0; d<4; ++d){
   }
 }
 // top groups (by (dtype,shape))
-size_t shown = 0;
 for (size_t i=0; i<g_groups_n && i<50; ++i){ // show up to 50 lines max
   double gib = (double)g_groups[i].bytes / (double)(1ull<<30);
   fprintf(stderr, "  %s : %zu tensors, %.3f GiB\n", g_groups[i].key, g_groups[i].count, gib);
-  shown++;
 }
 if (g_rms_count){
   fprintf(stderr, "  rms/rmsnorm tensors: %zu\n", g_rms_count);
@@ -454,5 +452,226 @@ void print_progress_bar(size_t done, size_t total){
 
 void finish_progress_bar(void){
   fputs("\n", stderr);
+}
+
+/**
+ * Write a single tensor to a file in the same format as export.py
+ * Includes magic header, tensor count (1), and tensor data
+ */
+static void write_tensor_to_file(FILE* f, const TensorBin* tensor) {
+    // Write tensor name
+    uint32_t name_len = (uint32_t)strlen(tensor->name);
+    fwrite(&name_len, sizeof(uint32_t), 1, f);
+    fwrite(tensor->name, 1, name_len, f);
+    
+    // Write tensor metadata
+    uint32_t dtype = (uint32_t)tensor->dtype;
+    uint32_t ndim = (uint32_t)tensor->ndim;
+    fwrite(&dtype, sizeof(uint32_t), 1, f);
+    fwrite(&ndim, sizeof(uint32_t), 1, f);
+    
+    // Write shape
+    for (int i = 0; i < tensor->ndim; i++) {
+        uint32_t dim = (uint32_t)tensor->shape[i];
+        fwrite(&dim, sizeof(uint32_t), 1, f);
+    }
+    
+    // Write tensor data
+    fwrite(tensor->data, 1, tensor->nbytes, f);
+}
+
+/**
+ * Save a complete BinFile to disk with proper magic header
+ * Returns 0 on success, -1 on error
+ */
+int bin_save(const BinFile* bf, const char* path) {
+    if (!bf || !path) return -1;
+    
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        perror(path);
+        return -1;
+    }
+    
+    // Write magic header
+    const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x01 };
+    fwrite(magic, 1, 6, f);
+    
+    // Write tensor count
+    uint32_t count = (uint32_t)bf->count;
+    fwrite(&count, sizeof(uint32_t), 1, f);
+    
+    // Write all tensors
+    for (int i = 0; i < bf->count; i++) {
+        write_tensor_to_file(f, &bf->arr[i]);
+    }
+    
+    fclose(f);
+    return 0;
+}
+
+/**
+ * Save a single tensor to disk as a standalone .bin file
+ * Returns 0 on success, -1 on error
+ */
+int bin_save_single_tensor(const TensorBin* tensor, const char* path) {
+    if (!tensor || !path) return -1;
+    
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        perror(path);
+        return -1;
+    }
+    
+    // Write magic header
+    const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x01 };
+    fwrite(magic, 1, 6, f);
+    
+    // Write tensor count (1)
+    uint32_t count = 1;
+    fwrite(&count, sizeof(uint32_t), 1, f);
+    
+    // Write the tensor
+    write_tensor_to_file(f, tensor);
+    
+    fclose(f);
+    return 0;
+}
+
+/**
+ * Create a new tensor with the given parameters
+ * Allocates memory and copies the data
+ */
+TensorBin* tensor_create(const char* name, int dtype, int ndim, const int* shape, const void* data) {
+    if (!name || !shape || !data || ndim <= 0) return NULL;
+    
+    TensorBin* tensor = (TensorBin*)malloc(sizeof(TensorBin));
+    if (!tensor) return NULL;
+    
+    // Copy name
+    size_t name_len = strlen(name);
+    tensor->name = (char*)malloc(name_len + 1);
+    if (!tensor->name) {
+        free(tensor);
+        return NULL;
+    }
+    strcpy(tensor->name, name);
+    
+    // Copy shape
+    tensor->shape = (int*)malloc(sizeof(int) * ndim);
+    if (!tensor->shape) {
+        free(tensor->name);
+        free(tensor);
+        return NULL;
+    }
+    memcpy(tensor->shape, shape, sizeof(int) * ndim);
+    
+    // Calculate data size based on dtype and shape
+    size_t elements = 1;
+    for (int i = 0; i < ndim; i++) {
+        elements *= (size_t)shape[i];
+    }
+    
+    size_t bytes_per_element;
+    switch (dtype) {
+        case 0: bytes_per_element = 4; break; // f32
+        case 1: bytes_per_element = 2; break; // f16
+        case 2: bytes_per_element = 1; break; // i8
+        case 3: bytes_per_element = 1; break; // i4 (packed)
+        default:
+            free(tensor->shape);
+            free(tensor->name);
+            free(tensor);
+            return NULL;
+    }
+    
+    size_t data_size = elements * bytes_per_element;
+    
+    // Copy data
+    tensor->data = malloc(data_size);
+    if (!tensor->data) {
+        free(tensor->shape);
+        free(tensor->name);
+        free(tensor);
+        return NULL;
+    }
+    memcpy(tensor->data, data, data_size);
+    
+    tensor->dtype = dtype;
+    tensor->ndim = ndim;
+    tensor->nbytes = data_size;
+    
+    return tensor;
+}
+
+/**
+ * Free a single tensor (used when tensor is not part of a BinFile array)
+ */
+void tensor_free_single(TensorBin* tensor) {
+    if (!tensor) return;
+    
+    free(tensor->name);
+    free(tensor->shape);
+    free(tensor->data);
+    free(tensor);
+}
+
+/**
+ * Create an empty BinFile structure
+ */
+BinFile* binfile_create(void) {
+    BinFile* bf = (BinFile*)malloc(sizeof(BinFile));
+    if (!bf) return NULL;
+    
+    bf->arr = NULL;
+    bf->count = 0;
+    return bf;
+}
+
+/**
+ * Add a tensor to a BinFile (copies the tensor data)
+ * Returns 0 on success, -1 on error
+ */
+int binfile_add_tensor(BinFile* bf, const TensorBin* tensor) {
+    if (!bf || !tensor) return -1;
+    
+    // Resize array if needed
+    TensorBin* new_arr = (TensorBin*)realloc(bf->arr, sizeof(TensorBin) * (bf->count + 1));
+    if (!new_arr) return -1;
+    
+    bf->arr = new_arr;
+    
+    // Copy tensor data
+    TensorBin* dest = &bf->arr[bf->count];
+    
+    // Copy name
+    size_t name_len = strlen(tensor->name);
+    dest->name = (char*)malloc(name_len + 1);
+    if (!dest->name) return -1;
+    strcpy(dest->name, tensor->name);
+    
+    // Copy shape
+    dest->shape = (int*)malloc(sizeof(int) * tensor->ndim);
+    if (!dest->shape) {
+        free(dest->name);
+        return -1;
+    }
+    memcpy(dest->shape, tensor->shape, sizeof(int) * tensor->ndim);
+    
+    // Copy data
+    dest->data = malloc(tensor->nbytes);
+    if (!dest->data) {
+        free(dest->shape);
+        free(dest->name);
+        return -1;
+    }
+    memcpy(dest->data, tensor->data, tensor->nbytes);
+    
+    dest->dtype = tensor->dtype;
+    dest->ndim = tensor->ndim;
+    dest->nbytes = tensor->nbytes;
+    
+    bf->count++;
+    return 0;
 }
 
