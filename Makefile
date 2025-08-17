@@ -27,5 +27,5 @@ tokenizer_demo: tokenizer_demo.o tokenizer.o
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo
+	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace
 	$(RM) -f qwen3_tokenizer.bin qwen3_tokenizer_meta.json

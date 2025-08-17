@@ -342,12 +342,10 @@ for each output C[m,n]:
 
 This implementation provides a foundation for quantized MoE inference. Areas for improvement:
 
-1. **Vectorization**: Add SIMD optimizations for quantized kernels
-2. **Parallelization**: OpenMP support for multi-core inference  
-3. **GPU Support**: CUDA kernels for quantized operations
-4. **Advanced Quantization**: Group quantization, mixed precision schemes
-5. **Calibration**: Data-dependent quantization parameter tuning
-
+1. **Parallelization**:  Add threading/distributed inference using Tensor Parallelism: use pthreads/openmp/MPI etc
+2. **Vectorization**: Add SIMD optimizations for quantized kernels
+3. **Advanced Quantization**: Group quantization, mixed precision schemes
+4. **Optimization**: efficient quant kernels, parallelization, profiling
 ---
 
 ## Citation
@@ -356,9 +354,9 @@ If you use this code in your research, please cite:
 
 ```bibtex
 @software{qwen3_moe_quantized,
-  title={Quantized MoE Inference for Qwen3-30B-A3B},
-  author={AI Assistant},
+  title={MoE Inference in C/C++},
+  author={Kamil Rocki},
   year={2024},
-  url={https://github.com/your-repo/moe.cc}
+  url={https://github.com/krocki-repo/moe.cc}
 }
 ```

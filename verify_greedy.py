@@ -388,7 +388,7 @@ def _trace_one_layer(model, cfg, h, L, mask, outbase, step):
 
     # 1) norm1 (float32 for parity)
     x_norm1 = blk.norm1(h.to(torch.float32))
-    np.save(f"{outbase}.step{step}.L{L}.x_norm1.npy", x_norm1.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.x_norm1.npy", x_norm1.squeeze(0).cpu().numpy().astype(np.float32))
 
     # 2) attention (explicit, mirrors kernels and Raschka)
     d = att.head_dim
@@ -400,16 +400,16 @@ def _trace_one_layer(model, cfg, h, L, mask, outbase, step):
     K = torch.nn.functional.linear(x_norm1, att.W_key.weight  ).view(1,T,Hkv,d).transpose(1,2)
     V = torch.nn.functional.linear(x_norm1, att.W_value.weight).view(1,T,Hkv,d).transpose(1,2)
 
-    np.save(f"{outbase}.step{step}.L{L}.Q_proj_flat.npy", Q.squeeze(0).reshape(T, Hq*d).cpu().numpy().astype(np.float32))
-    np.save(f"{outbase}.step{step}.L{L}.K_proj_flat.npy", K.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
-    np.save(f"{outbase}.step{step}.L{L}.V_proj_flat.npy", V.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.Q_proj_flat.npy", Q.squeeze(0).reshape(T, Hq*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.K_proj_flat.npy", K.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.V_proj_flat.npy", V.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
 
     if att.q_norm is not None:
         Q = att.q_norm(Q)
         K = att.k_norm(K)
 
-    np.save(f"{outbase}.step{step}.L{L}.Q_qknorm_flat.npy", Q.squeeze(0).reshape(T, Hq*d).cpu().numpy().astype(np.float32))
-    np.save(f"{outbase}.step{step}.L{L}.K_qknorm_flat.npy", K.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.Q_qknorm_flat.npy", Q.squeeze(0).reshape(T, Hq*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.K_qknorm_flat.npy", K.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
 
     # RoPE using the SAME cos/sin buffers (we will save them once from model)
     def _apply_rope(x):
@@ -423,8 +423,8 @@ def _trace_one_layer(model, cfg, h, L, mask, outbase, step):
     Q = _apply_rope(Q)
     K = _apply_rope(K)
 
-    np.save(f"{outbase}.step{step}.L{L}.Q_rope_flat.npy", Q.squeeze(0).reshape(T, Hq*d).cpu().numpy().astype(np.float32))
-    np.save(f"{outbase}.step{step}.L{L}.K_rope_flat.npy", K.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.Q_rope_flat.npy", Q.squeeze(0).reshape(T, Hq*d).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.K_rope_flat.npy", K.squeeze(0).reshape(T, Hkv*d).cpu().numpy().astype(np.float32))
 
     K = K.repeat_interleave(group, dim=1)
     V = V.repeat_interleave(group, dim=1)
@@ -432,30 +432,30 @@ def _trace_one_layer(model, cfg, h, L, mask, outbase, step):
     S = (Q @ K.transpose(2,3)) / (d ** 0.5)
     S = S.masked_fill(mask, float('-inf'))
     P = torch.softmax(S, dim=-1)
-    np.save(f"{outbase}.step{step}.L{L}.S.npy", S.squeeze(0).cpu().numpy().astype(np.float32))
-    np.save(f"{outbase}.step{step}.L{L}.P.npy", P.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.S.npy", S.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.P.npy", P.squeeze(0).cpu().numpy().astype(np.float32))
 
     ctx = (P @ V).transpose(1,2).reshape(1,T,Hq*d)
     attn_out = torch.nn.functional.linear(ctx, att.out_proj.weight)
-    np.save(f"{outbase}.step{step}.L{L}.attn_out.npy", attn_out.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.attn_out.npy", attn_out.squeeze(0).cpu().numpy().astype(np.float32))
 
     x_after_attn = (h.to(torch.float32) + attn_out.to(torch.float32))
-    np.save(f"{outbase}.step{step}.L{L}.x_after_attn.npy", x_after_attn.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.x_after_attn.npy", x_after_attn.squeeze(0).cpu().numpy().astype(np.float32))
 
     x_norm2 = blk.norm2(x_after_attn.to(torch.float32))
-    np.save(f"{outbase}.step{step}.L{L}.x_norm2.npy", x_norm2.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.x_norm2.npy", x_norm2.squeeze(0).cpu().numpy().astype(np.float32))
 
     ff = blk.ff
     logits = torch.nn.functional.linear(x_norm2, ff.gate.weight)
     if ff.gate_bias is not None:
         logits = logits + ff.gate_bias
-    np.save(f"{outbase}.step{step}.L{L}.router_logits.npy", logits.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.router_logits.npy", logits.squeeze(0).cpu().numpy().astype(np.float32))
 
     k = ff.num_experts_per_tok
     topk_scores, topk_idx = torch.topk(logits, k, dim=-1)
     topk_p = torch.softmax(topk_scores, dim=-1)
-    np.save(f"{outbase}.step{step}.L{L}.router_topk_idx.npy", topk_idx.squeeze(0).cpu().numpy().astype(np.int32))
-    np.save(f"{outbase}.step{step}.L{L}.router_topk_p.npy", topk_p.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.router_topk_idx.npy", topk_idx.squeeze(0).cpu().numpy().astype(np.int32))
+    # np.save(f"{outbase}.step{step}.L{L}.router_topk_p.npy", topk_p.squeeze(0).cpu().numpy().astype(np.float32))
 
     E = ff.num_experts
     outs = []
@@ -470,10 +470,10 @@ def _trace_one_layer(model, cfg, h, L, mask, outbase, step):
     gating = torch.zeros_like(logits)
     gating.scatter_(dim=-1, index=topk_idx, src=topk_p)
     moe_out = (gating.unsqueeze(-1) * expert_out).sum(dim=2)
-    np.save(f"{outbase}.step{step}.L{L}.moe_out.npy", moe_out.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.moe_out.npy", moe_out.squeeze(0).cpu().numpy().astype(np.float32))
 
     y = x_after_attn + moe_out
-    np.save(f"{outbase}.step{step}.L{L}.y.npy", y.squeeze(0).cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.step{step}.L{L}.y.npy", y.squeeze(0).cpu().numpy().astype(np.float32))
     return y
 
 @torch.no_grad()
@@ -483,8 +483,8 @@ def run_and_dump(model, cfg, steps, ids, outbase):
     D = cfg["emb_dim"]
 
     # --- NEW: dump cos/sin once so C can reuse the exact buffers
-    np.save(f"{outbase}.cos.npy", model.cos.cpu().numpy().astype(np.float32))
-    np.save(f"{outbase}.sin.npy", model.sin.cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.cos.npy", model.cos.cpu().numpy().astype(np.float32))
+    # np.save(f"{outbase}.sin.npy", model.sin.cpu().numpy().astype(np.float32))
 
     if steps == 0:
         np.save(f"{outbase}.ids.npy", ids.squeeze(0).cpu().numpy().astype(np.int32))
@@ -497,7 +497,7 @@ def run_and_dump(model, cfg, steps, ids, outbase):
     for s in range(steps):
         T = ids.shape[-1]
         x = model.tok_emb(ids).to(torch.float32)
-        np.save(f"{outbase}.step{s}.x.npy", x.squeeze(0).cpu().numpy().astype(np.float32))
+        # np.save(f"{outbase}.step{s}.x.npy", x.squeeze(0).cpu().numpy().astype(np.float32))
 
         mask = torch.triu(torch.ones(T,T, device=device, dtype=torch.bool), diagonal=1).view(1,1,T,T)
         h = x
