@@ -4,7 +4,7 @@ CFLAGS = -g -O2 -Wall -DDEBUG -DBENCH
 
 OBJS = io.o utils.o quant.o
 
-all: list_bin test_model_trace tokenizer_demo tokenizer_test convert
+all: list_bin test_model_trace tokenizer_demo tokenizer_test convert test_matmul_harness
 
 # Main targets
 convert: convert.o $(OBJS)
@@ -18,6 +18,9 @@ test_convert_integration: test_convert_integration.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 test_group_quantization: test_group_quantization.o $(OBJS) kernels.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+test_matmul_harness: test_matmul_harness.o $(OBJS) kernels.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # Test runner targets
@@ -58,5 +61,5 @@ tokenizer_demo: tokenizer_demo.o tokenizer.o
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace convert test_convert test_convert_integration test_group_quantization
+	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace convert test_convert test_convert_integration test_group_quantization test_matmul_harness
 	$(RM) -f qwen3_tokenizer.bin qwen3_tokenizer_meta.json

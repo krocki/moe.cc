@@ -17,7 +17,7 @@
  * - Only expert weight matrices are quantized (gate_proj, up_proj, down_proj)
  */
 
-#define CONVERT_VERSION "2.1.0"  // Version for debugging and compatibility tracking - Added streaming I/O
+#define CONVERT_VERSION "3.0.0"  // Group-wise only quantization with matmul kernels
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +35,7 @@ typedef struct {
   char* input_path;      // Input .bin file path
   char* output_path;     // Output .bin file path  
   QuantType quant_type;  // Quantization type (Q8, Q4, or NONE)
-  size_t group_size;     // Group size for quantization (0 = rowwise)
+  size_t group_size;     // Group size for quantization (required > 0)
   bool verbose;          // Enable verbose output
   bool help;             // Show help and exit
   bool version;          // Show version and exit
@@ -47,25 +47,23 @@ typedef struct {
 static void print_usage(const char* program_name) {
   printf("Tensor Quantization Conversion Tool v%s\n", CONVERT_VERSION);
   printf("Converts FP32 tensors to quantized formats (Q8/Q4) in C\n\n");
-  printf("Usage: %s --input INPUT.bin --quant QUANT_TYPE --output OUTPUT.bin\n\n", program_name);
+  printf("Usage: %s --input INPUT.bin --quant QUANT_TYPE --group-size N --output OUTPUT.bin\n\n", program_name);
   printf("Required Arguments:\n");
-  printf("  --input PATH    Input .bin file (FP32 tensors)\n");
-  printf("  --quant TYPE    Quantization type: q8, q4, or none\n");
-  printf("  --output PATH   Output .bin file (quantized tensors)\n\n");
+  printf("  --input PATH      Input .bin file (FP32 tensors)\n");
+  printf("  --quant TYPE      Quantization type: q8, q4, or none\n");
+  printf("  --group-size N    Group size for quantization (32, 64, 128, etc.)\n");
+  printf("  --output PATH     Output .bin file (quantized tensors)\n\n");
   printf("Optional Arguments:\n");
-  printf("  --group-size N  Group size for quantization (default: 0 = rowwise)\n");
   printf("  --verbose       Enable verbose output\n");
   printf("  --version       Show version information\n");
   printf("  --help          Show this help message\n\n");
   printf("Examples:\n");
-  printf("  # Convert complete model to Q8\n");
-  printf("  %s --input all.bin --quant q8 --output all_q8.bin\n\n", program_name);
-  printf("  # Convert complete model to Q4\n");
-  printf("  %s --input all.bin --quant q4 --output all_q4.bin\n\n", program_name);
-  printf("  # Convert single tensor\n");
-  printf("  %s --input layer.weight.bin --quant q8 --output layer.weight_q8.bin\n\n", program_name);
-  printf("  # Convert with group quantization\n");
-  printf("  %s --input all.bin --quant q4 --group-size 128 --output all_q4_g128.bin\n\n", program_name);
+  printf("  # Convert complete model to Q8 with group size 128\n");
+  printf("  %s --input all.bin --quant q8 --group-size 128 --output all_q8.bin\n\n", program_name);
+  printf("  # Convert complete model to Q4 with group size 64\n");
+  printf("  %s --input all.bin --quant q4 --group-size 64 --output all_q4.bin\n\n", program_name);
+  printf("  # Convert single tensor with group size 32\n");
+  printf("  %s --input layer.weight.bin --quant q8 --group-size 32 --output layer.weight_q8.bin\n\n", program_name);
   printf("Notes:\n");
   printf("  - Only expert weight matrices are quantized (gate_proj, up_proj, down_proj)\n");
   printf("  - Other tensors (attention, norms, embeddings) remain FP32\n");
@@ -80,7 +78,7 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
   // Initialize config with defaults
   memset(config, 0, sizeof(ConvertConfig));
   config->quant_type = QUANT_NONE;
-  config->group_size = 0; // Default to rowwise quantization
+  config->group_size = 0; // Will be required to be > 0
   
   // Define long options
   static struct option long_options[] = {
@@ -121,8 +119,8 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
         {
           char* endptr;
           long group_size = strtol(optarg, &endptr, 10);
-          if (*endptr != '\0' || group_size < 0) {
-            fprintf(stderr, "Error: Invalid group size '%s'. Must be a non-negative integer.\n", optarg);
+          if (*endptr != '\0' || group_size <= 0) {
+            fprintf(stderr, "Error: Invalid group size '%s'. Must be a positive integer.\n", optarg);
             return -1;
           }
           config->group_size = (size_t)group_size;
@@ -158,6 +156,10 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
     }
     if (config->quant_type == QUANT_NONE) {
       fprintf(stderr, "Error: --quant is required (q8, q4, or none)\n");
+      return -1;
+    }
+    if (config->group_size == 0) {
+      fprintf(stderr, "Error: --group-size is required (must be > 0, e.g., 32, 64, 128)\n");
       return -1;
     }
   }
