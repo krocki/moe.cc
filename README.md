@@ -7,13 +7,14 @@ A C implementation for Qwen3-30B-A3B MoE inference with quantized expert weights
 - **Mixed Precision**: FP32 for attention/norms, quantized weights for experts  
 - **Memory Efficient**: Up to 4x memory reduction for expert weights (75% of model size)
 - **Fast Inference**: Optimized quantized matrix multiplication kernels
-- **Accuracy Preservation**: Minimal quality loss through rowwise quantization
+- **Group-wise Quantization**: Support for both rowwise and group-wise quantization schemes
+- **Accuracy Preservation**: Minimal quality loss with optimized quantization schemes
 - **Flexible Export**: Selective quantization of expert weights only
 
 ## Architecture Support
 - **Model**: Qwen3-30B-A3B (48 layers, 256 experts per layer)
 - **Expert Types**: gate_proj, up_proj, down_proj weight matrices
-- **Quantization**: Rowwise Q8/Q4 with per-row scaling factors
+- **Quantization**: Rowwise and group-wise Q8/Q4 with configurable group sizes
 - **Precision**: FP32 for attention, router, norms; Q8/Q4 for expert weights
 
 ## Setup
@@ -41,8 +42,9 @@ make
 
 This builds:
 - `test_model_trace` - Main inference engine
-- `convert` - Tensor quantization tool
+- `convert` - Tensor quantization tool with version tracking
 - `list_bin` - Tensor file inspector
+- `debug_group_size` - Group-size metadata diagnostic tool
 - Test programs and utilities
 
 ### 2. Export Model Weights
@@ -89,11 +91,17 @@ For faster quantization without Python dependencies:
 python3 export.py --model Qwen/Qwen3-30B-A3B --all --quant none --outdir qwen3-30b-a3_f32
 python3 merge_dir.py all.bin qwen3-30b-a3_f32
 
-# Convert to Q8 using C
+# Convert to Q8 using C (rowwise)
 ./convert --input all.bin --quant q8 --output all_q8.bin
 
-# Convert to Q4 using C  
+# Convert to Q8 with group-size quantization
+./convert --input all.bin --quant q8 --output all_q8_g128.bin --group-size 128
+
+# Convert to Q4 using C (rowwise)
 ./convert --input all.bin --quant q4 --output all_q4.bin
+
+# Convert to Q4 with group-size quantization  
+./convert --input all.bin --quant q4 --output all_q4_g32.bin --group-size 32
 ```
 
 ### 3. Generate Reference Traces (Optional)
@@ -134,14 +142,23 @@ The `convert` program provides direct tensor quantization in C, eliminating the 
 ### Convert Program Usage
 
 ```bash
-# Convert complete model to Q8 quantization
+# Convert complete model to Q8 quantization (rowwise)
 ./convert --input all.bin --quant q8 --output all_q8.bin
 
-# Convert complete model to Q4 quantization  
+# Convert complete model to Q8 with group-size quantization
+./convert --input all.bin --quant q8 --output all_q8_g128.bin --group-size 128 --verbose
+
+# Convert complete model to Q4 quantization (rowwise)
 ./convert --input all.bin --quant q4 --output all_q4.bin
+
+# Convert complete model to Q4 with group-size quantization
+./convert --input all.bin --quant q4 --output all_q4_g32.bin --group-size 32 --verbose
 
 # Convert single tensor file
 ./convert --input tensor.bin --quant q8 --output tensor_q8.bin --verbose
+
+# Show version information
+./convert --version
 
 # Show help
 ./convert --help
@@ -151,9 +168,11 @@ The `convert` program provides direct tensor quantization in C, eliminating the 
 
 - **Selective Quantization**: Only expert weight matrices are quantized (gate_proj, up_proj, down_proj)
 - **Compatible Output**: Produces identical results to export.py quantization
-- **Multiple Formats**: Supports Q8 (8-bit) and Q4 (4-bit) rowwise quantization
+- **Multiple Formats**: Supports Q8 (8-bit) and Q4 (4-bit) with rowwise and group-wise quantization
+- **Group-size Support**: Configurable group sizes for improved accuracy (e.g., 32, 64, 128)
 - **Fast Processing**: Direct C implementation for efficient conversion
-- **Verbose Mode**: Optional detailed progress reporting
+- **Version Tracking**: Built-in version information for debugging and compatibility
+- **Verbose Mode**: Optional detailed progress reporting with group-size information
 
 ### File Compatibility
 
@@ -176,25 +195,33 @@ make test-unit
 make test-integration
 ```
 
+### Diagnostic Tools
+
+The repository includes diagnostic tools for debugging quantization issues:
+
+```bash
+# Inspect group-size metadata in quantized files
+./debug_group_size all_q8_g128.bin
+
+# Test group-size I/O functionality  
+./test_group_size_io
+```
+
 ### Performance Comparison
 
-| Method | Time | Memory | File Size |
-|--------|------|--------|-----------|
-| export.py + merge | ~15min | ~60GB | 33GB |
-| ./convert | ~3min | ~35GB | 33GB |
-
-## Todo:
-- add quantize group size
-- implement tests for quantized matmul in kernels.c
+| Method | Time | Memory | File Size | Features |
+|--------|------|--------|-----------|----------|
+| export.py + merge | ~15min | ~60GB | 33GB | Python dependencies |
+| ./convert | ~3min | ~35GB | 33GB | C-only, group-size support |
 
 ## Contributing
 
 This implementation provides a foundation for quantized MoE inference. Areas for improvement:
 
-1. **Parallelization**:  Add threading/distributed inference using Tensor Parallelism: use pthreads/openmp/MPI etc
+1. **Parallelization**: Add threading/distributed inference using Tensor Parallelism: use pthreads/openmp/MPI etc
 2. **Vectorization**: Add SIMD optimizations for quantized kernels
-3. **Advanced Quantization**: Group quantization, mixed precision schemes
-4. **Optimization**: efficient quant kernels, parallelization, profiling
+3. **Advanced Quantization**: Additional group sizes, mixed precision schemes
+4. **Optimization**: Enhanced kernels, parallelization, profiling
 ---
 
 ## Citation
