@@ -17,12 +17,17 @@ test_convert: test_convert.o $(OBJS)
 test_convert_integration: test_convert_integration.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+test_group_quantization: test_group_quantization.o $(OBJS) kernels.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 # Test runner targets
-test: test_convert test_convert_integration convert
+test: test_convert test_convert_integration test_group_quantization convert
 	@echo "Running unit tests..."
 	./test_convert
 	@echo "Running integration tests..."
 	./test_convert_integration
+	@echo "Running group quantization tests..."
+	./test_group_quantization
 
 test-unit: test_convert
 	@echo "Running unit tests..."
@@ -53,5 +58,5 @@ tokenizer_demo: tokenizer_demo.o tokenizer.o
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace convert test_convert test_convert_integration
+	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace convert test_convert test_convert_integration test_group_quantization
 	$(RM) -f qwen3_tokenizer.bin qwen3_tokenizer_meta.json

@@ -25,9 +25,10 @@ typedef struct {
 // Quantized weight structure for expert matrices
 typedef struct {
   const int8_t* q;      // quantized weights
-  const float* s;       // scales (per row)
+  const float* s;       // scales (per row or per group)
   int rows, cols;       // dimensions
   int dtype;            // 2=q8, 3=q4 (matches TensorBin dtypes)
+  size_t group_size;    // group size for quantization (0 = rowwise)
 } QuantizedWeight;
 #define QUANTIZED_WEIGHT_DEFINED
 
@@ -80,30 +81,23 @@ static TensorBin* need(BinFile* b, const char* k){
 }
 static TensorBin* maybe(BinFile* b, const char* k){ return bin_find(b,k); }
 
-// Helper function to find a tensor, prioritizing the original name
-static TensorBin* need_adaptive(BinFile* b, const char* k) {
-  TensorBin* t = bin_find(b, k);
-  if (t) return t;
-  
-  // If original tensor not found, it might be quantized
-  // This happens when we're loading a quantized model but still looking for original names
-  char q8_name[512], q4_name[512];
-  snprintf(q8_name, sizeof(q8_name), "%s.q8", k);
-  snprintf(q4_name, sizeof(q4_name), "%s.q4", k);
-  
-  t = bin_find(b, q8_name);
-  if (t) return t;  // Found Q8 version
-  
-  t = bin_find(b, q4_name);
-  if (t) return t;  // Found Q4 version
-  
-  // Still not found - this is an error
-  fprintf(stderr, "missing %s (tried fp32, q8, q4)\n", k);
-  exit(1);
-}
+// Note: need_adaptive function was removed as it was unused
+// If adaptive tensor loading is needed in the future, implement a version
+// that properly handles the new group_size metadata
 
-// Fill QwenWeights/QwenConfig from all.bin (Qwen/Qwen3-30B-A3B layout).
-// Only strings appear here (one-time), never inside the forward loops.
+/**
+ * Load complete Qwen3-30B-A3B model weights from binary file
+ * 
+ * This function initializes QwenConfig and QwenWeights structures from a binary
+ * file containing the complete model. It handles both FP32 and quantized weights,
+ * automatically detecting quantization format and populating appropriate structures.
+ * 
+ * Used by: test_model_trace.c for model inference testing
+ * 
+ * @param bf: BinFile containing all model tensors
+ * @param cfg: Output QwenConfig structure to populate
+ * @param w: Output QwenWeights structure to populate  
+ */
 static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
   // Infer sizes (consistent with your verified setup)
   // d_model, vocab, head_dim, n_q, n_kv, n_layers, d_ff, n_experts, top_k
@@ -245,6 +239,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           lw->Wg_q[e].rows = q_data->shape[0];
           lw->Wg_q[e].cols = q_data->shape[1];
           lw->Wg_q[e].dtype = 2; // q8
+          lw->Wg_q[e].group_size = s_data->group_size;
         } else {
           snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.q4",L,e);
           TensorBin* q_data = need(bf,k);
@@ -255,6 +250,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           lw->Wg_q[e].rows = q_data->shape[0];
           lw->Wg_q[e].cols = q_data->shape[1] * 2; // q4 packs 2 values per byte
           lw->Wg_q[e].dtype = 3; // q4
+          lw->Wg_q[e].group_size = s_data->group_size;
         }
         
         // Up projection  
@@ -268,6 +264,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           lw->Wu_q[e].rows = q_data->shape[0];
           lw->Wu_q[e].cols = q_data->shape[1];
           lw->Wu_q[e].dtype = 2;
+          lw->Wu_q[e].group_size = s_data->group_size;
         } else {
           snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.q4",L,e);
           TensorBin* q_data = need(bf,k);
@@ -278,6 +275,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           lw->Wu_q[e].rows = q_data->shape[0];
           lw->Wu_q[e].cols = q_data->shape[1] * 2;
           lw->Wu_q[e].dtype = 3;
+          lw->Wu_q[e].group_size = s_data->group_size;
         }
         
         // Down projection
@@ -291,6 +289,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           lw->Wd_q[e].rows = q_data->shape[0];
           lw->Wd_q[e].cols = q_data->shape[1];
           lw->Wd_q[e].dtype = 2;
+          lw->Wd_q[e].group_size = s_data->group_size;
         } else {
           snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.q4",L,e);
           TensorBin* q_data = need(bf,k);
@@ -301,6 +300,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           lw->Wd_q[e].rows = q_data->shape[0];
           lw->Wd_q[e].cols = q_data->shape[1] * 2;
           lw->Wd_q[e].dtype = 3;
+          lw->Wd_q[e].group_size = s_data->group_size;
         }
       }
     } else {

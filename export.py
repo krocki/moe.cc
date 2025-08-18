@@ -3,9 +3,10 @@
 import argparse, json, os, struct, torch
 from transformers import AutoModelForCausalLM, AutoConfig
 
-MAGIC = b"QW3W\x00\x01"  # magic + version
+MAGIC = b"QW3W\x00\x02"  # magic + version (v2 with group_size support)
 
-def _save_tensor(f, name, t):
+def _save_tensor(f, name, t, group_size=0):
+  """Save tensor to binary file with v2 format (includes group_size metadata)."""
   t = t.contiguous()
   name_b = name.encode()
   f.write(struct.pack("<I", len(name_b))); f.write(name_b)
@@ -19,6 +20,8 @@ def _save_tensor(f, name, t):
   f.write(struct.pack("<I", t.dim()))
   f.write(struct.pack("<" + "I"*t.dim(), *t.shape))
   f.write(t.cpu().numpy().tobytes())
+  # v2 format: write group_size metadata
+  f.write(struct.pack("<I", group_size))
 
 def _rowwise_q8(w):  # (out,in) -> (scales, q)
   w = w.float().contiguous()
@@ -34,6 +37,69 @@ def _rowwise_q4(w):  # pack 2x int4 per byte
   lo = q[:, ::2]; hi = q[:, 1::2]
   packed = (lo | (hi << 4)).contiguous()
   return s.squeeze(1).to(torch.float32), packed
+
+def _groupwise_q8(w, group_size):
+  """Group-wise Q8 quantization: quantize in groups of specified size."""
+  w = w.float().contiguous()
+  rows, cols = w.shape
+  total_elements = rows * cols
+  
+  # Reshape to linear array for group processing
+  w_flat = w.view(-1)
+  num_groups = (total_elements + group_size - 1) // group_size
+  
+  # Pad if necessary
+  pad_size = num_groups * group_size - total_elements
+  if pad_size > 0:
+    w_flat = torch.cat([w_flat, torch.zeros(pad_size, dtype=w.dtype, device=w.device)])
+  
+  # Reshape into groups
+  w_groups = w_flat.view(num_groups, group_size)
+  
+  # Compute scales per group
+  scales = w_groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 127.0
+  
+  # Quantize each group
+  q_groups = torch.round(w_groups / scales).to(torch.int8)
+  
+  # Reshape back to original tensor shape
+  q = q_groups.view(-1)[:total_elements].view(rows, cols)
+  
+  return scales.squeeze(1).to(torch.float32), q
+
+def _groupwise_q4(w, group_size):
+  """Group-wise Q4 quantization: quantize in groups of specified size then pack."""
+  w = w.float().contiguous()
+  rows, cols = w.shape
+  total_elements = rows * cols
+  
+  # Reshape to linear array for group processing
+  w_flat = w.view(-1)
+  num_groups = (total_elements + group_size - 1) // group_size
+  
+  # Pad if necessary
+  pad_size = num_groups * group_size - total_elements
+  if pad_size > 0:
+    w_flat = torch.cat([w_flat, torch.zeros(pad_size, dtype=w.dtype, device=w.device)])
+  
+  # Reshape into groups
+  w_groups = w_flat.view(num_groups, group_size)
+  
+  # Compute scales per group
+  scales = w_groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 7.0
+  
+  # Quantize each group
+  q_groups = torch.round(w_groups / scales).clamp_(-8, 7).to(torch.int8)
+  
+  # Reshape back to original tensor shape
+  q = q_groups.view(-1)[:total_elements].view(rows, cols)
+  
+  # Convert to unsigned [0,15] and pack
+  q = (q + 8).to(torch.uint8)
+  lo = q[:, ::2]; hi = q[:, 1::2]
+  packed = (lo | (hi << 4)).contiguous()
+  
+  return scales.squeeze(1).to(torch.float32), packed
 
 def _is_norm_key(k: str) -> bool:
   # Qwen3: input_layernorm / post_attention_layernorm or rms_1 / rms_2
@@ -124,6 +190,7 @@ def main():
   ap.add_argument("--part", choices=["attn","mlp","norms"])
   ap.add_argument("--experts", nargs="+")  # e.g., 5,19 34
   ap.add_argument("--quant", choices=["none","q8","q4"], default="none")
+  ap.add_argument("--group-size", type=int, default=0, help="Group size for quantization (0 = rowwise)")
   args = ap.parse_args()
 
   if not args.out and not args.outdir:
@@ -156,19 +223,30 @@ def main():
         should_quant = _should_quantize(name, args) and t.dim() == 2
         
         if not should_quant:
-          _save_tensor(f, name, t.float())
+          _save_tensor(f, name, t.float(), group_size=0)
           qinfo = None
         else:
+          group_size = getattr(args, 'group_size', 0)
           if args.quant == "q8":
-            s,q = _rowwise_q8(t)
-            _save_tensor(f, name+".scale", s)
-            _save_tensor(f, name+".q8", q)
-            qinfo = {"scheme":"rowwise_q8"}
+            if group_size > 0:
+              s, q = _groupwise_q8(t, group_size)
+              scheme = f"groupwise_q8_gs{group_size}"
+            else:
+              s, q = _rowwise_q8(t)
+              scheme = "rowwise_q8"
+            _save_tensor(f, name+".scale", s, group_size=group_size)
+            _save_tensor(f, name+".q8", q, group_size=group_size)
+            qinfo = {"scheme": scheme, "group_size": group_size}
           else:  # q4
-            s,q = _rowwise_q4(t)
-            _save_tensor(f, name+".scale", s)
-            _save_tensor(f, name+".q4", q)
-            qinfo = {"scheme":"rowwise_q4"}
+            if group_size > 0:
+              s, q = _groupwise_q4(t, group_size)
+              scheme = f"groupwise_q4_gs{group_size}"
+            else:
+              s, q = _rowwise_q4(t)
+              scheme = "rowwise_q4"
+            _save_tensor(f, name+".scale", s, group_size=group_size)
+            _save_tensor(f, name+".q4", q, group_size=group_size)
+            qinfo = {"scheme": scheme, "group_size": group_size}
       
       # keep a light index
       shp = tuple(int(x) for x in t.shape)
@@ -194,16 +272,23 @@ def main():
       should_quant = _should_quantize(name, args) and t.dim() == 2
       
       if not should_quant:
-        _save_tensor(f, name, t.float())
+        _save_tensor(f, name, t.float(), group_size=0)
       else:
+        group_size = getattr(args, 'group_size', 0)
         if args.quant == "q8":
-          s,q = _rowwise_q8(t)
-          _save_tensor(f, name+".scale", s)
-          _save_tensor(f, name+".q8", q)
+          if group_size > 0:
+            s, q = _groupwise_q8(t, group_size)
+          else:
+            s, q = _rowwise_q8(t)
+          _save_tensor(f, name+".scale", s, group_size=group_size)
+          _save_tensor(f, name+".q8", q, group_size=group_size)
         elif args.quant == "q4":
-          s,q = _rowwise_q4(t)
-          _save_tensor(f, name+".scale", s)
-          _save_tensor(f, name+".q4", q)
+          if group_size > 0:
+            s, q = _groupwise_q4(t, group_size)
+          else:
+            s, q = _rowwise_q4(t)
+          _save_tensor(f, name+".scale", s, group_size=group_size)
+          _save_tensor(f, name+".q4", q, group_size=group_size)
 
 if __name__ == "__main__":
   main()

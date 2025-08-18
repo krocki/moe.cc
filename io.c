@@ -100,8 +100,8 @@ static void add_group_stat(int dtype, int ndim, const int* shape, size_t bytes){
 static struct timespec g_progress_start = {0,0};
 static int g_progress_multiline_started = 0;
 
-// Progress line
-static void progress_draw(size_t done_bytes, size_t total_bytes, size_t loaded, size_t total_tensors, const char* name){
+// Progress line - Made public for streaming convert usage
+void progress_draw(size_t done_bytes, size_t total_bytes, size_t loaded, size_t total_tensors, const char* name){
     if (!total_bytes) return;
 
     if (!g_progress_started) {
@@ -161,7 +161,7 @@ static void progress_draw(size_t done_bytes, size_t total_bytes, size_t loaded, 
 
 }
 
-static void progress_done(void){
+void progress_done(void){
   if (!g_progress_started){ fputs("\n", stderr); return; }
   const int width = 20;
   fputs("\x1b[2K\rLoading tensors [", stderr);
@@ -203,8 +203,14 @@ BinFile* bin_load(const char* path){
 
   unsigned char magic[6];
   if (fread(magic, 1, 6, f) != 6) { perror("magic"); exit(1); }
-  const unsigned char ref[6] = { 'Q','W','3','W',0x00,0x01 };
-  if (memcmp(magic, ref, 6) != 0){
+  const unsigned char ref_v1[6] = { 'Q','W','3','W',0x00,0x01 };
+  const unsigned char ref_v2[6] = { 'Q','W','3','W',0x00,0x02 };
+  int file_version = 1;
+  if (memcmp(magic, ref_v1, 6) == 0) {
+    file_version = 1;
+  } else if (memcmp(magic, ref_v2, 6) == 0) {
+    file_version = 2;
+  } else {
     fprintf(stderr, "Bad magic in %s\n", path);
     exit(1);
   }
@@ -269,6 +275,13 @@ BinFile* bin_load(const char* path){
     t->nbytes = elems * bpe;
     t->data   = xmalloc(t->nbytes);
     read_exact(f, t->data, t->nbytes);
+    
+    // Read group_size for v2 files (0 for v1 files)
+    if (file_version >= 2) {
+      t->group_size = (size_t)read_u32(f);
+    } else {
+      t->group_size = 0; // Default for v1 files (rowwise or non-quantized)
+    }
 
     // Increment count and stats
     bf->count++;
@@ -478,6 +491,10 @@ static void write_tensor_to_file(FILE* f, const TensorBin* tensor) {
     
     // Write tensor data
     fwrite(tensor->data, 1, tensor->nbytes, f);
+    
+    // Write group_size (v2 format)
+    uint32_t group_size = (uint32_t)tensor->group_size;
+    fwrite(&group_size, sizeof(uint32_t), 1, f);
 }
 
 /**
@@ -493,8 +510,8 @@ int bin_save(const BinFile* bf, const char* path) {
         return -1;
     }
     
-    // Write magic header
-    const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x01 };
+    // Write magic header (v2 format with group_size support)
+    const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x02 };
     fwrite(magic, 1, 6, f);
     
     // Write tensor count
@@ -523,8 +540,8 @@ int bin_save_single_tensor(const TensorBin* tensor, const char* path) {
         return -1;
     }
     
-    // Write magic header
-    const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x01 };
+    // Write magic header (v2 format with group_size support)
+    const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x02 };
     fwrite(magic, 1, 6, f);
     
     // Write tensor count (1)
@@ -600,7 +617,20 @@ TensorBin* tensor_create(const char* name, int dtype, int ndim, const int* shape
     tensor->dtype = dtype;
     tensor->ndim = ndim;
     tensor->nbytes = data_size;
+    tensor->group_size = 0; // Default to 0 (rowwise or non-quantized)
     
+    return tensor;
+}
+
+/**
+ * Create a TensorBin with specified group_size metadata
+ * Used for quantized tensors that need group_size information
+ */
+TensorBin* tensor_create_with_group_size(const char* name, int dtype, int ndim, const int* shape, const void* data, size_t group_size) {
+    TensorBin* tensor = tensor_create(name, dtype, ndim, shape, data);
+    if (tensor) {
+        tensor->group_size = group_size;
+    }
     return tensor;
 }
 
@@ -670,8 +700,316 @@ int binfile_add_tensor(BinFile* bf, const TensorBin* tensor) {
     dest->dtype = tensor->dtype;
     dest->ndim = tensor->ndim;
     dest->nbytes = tensor->nbytes;
+    dest->group_size = tensor->group_size;  // CRITICAL FIX: Copy group_size field
     
     bf->count++;
     return 0;
+}
+
+/**
+ * STREAMING I/O FUNCTIONS FOR MEMORY-EFFICIENT TENSOR PROCESSING
+ * 
+ * These functions enable processing large binary files tensor-by-tensor
+ * without loading the entire file into memory, significantly reducing
+ * memory usage during quantization conversion.
+ */
+
+/**
+ * Open a binary file for streaming tensor reading
+ * 
+ * @param path Path to the binary file to read
+ * @return BinStreamReader* on success, NULL on failure
+ * 
+ * This function reads and validates the file header, determines the file version,
+ * and initializes streaming state for tensor-by-tensor processing.
+ */
+BinStreamReader* bin_stream_reader_open(const char* path) {
+  FILE* f = fopen(path, "rb");
+  if (!f) {
+    perror(path);
+    return NULL;
+  }
+
+  // Determine total file size for progress tracking
+  struct stat st;
+  size_t total_bytes = 0;
+  if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode)) {
+    total_bytes = (size_t)st.st_size;
+  }
+
+  // Read and validate magic header
+  unsigned char magic[6];
+  if (fread(magic, 1, 6, f) != 6) {
+    perror("Failed to read magic header");
+    fclose(f);
+    return NULL;
+  }
+
+  // Determine file version
+  const unsigned char ref_v1[6] = { 'Q','W','3','W',0x00,0x01 };
+  const unsigned char ref_v2[6] = { 'Q','W','3','W',0x00,0x02 };
+  int file_version = 1;
+  if (memcmp(magic, ref_v1, 6) == 0) {
+    file_version = 1;
+  } else if (memcmp(magic, ref_v2, 6) == 0) {
+    file_version = 2;
+  } else {
+    fprintf(stderr, "Invalid magic header in %s\n", path);
+    fclose(f);
+    return NULL;
+  }
+
+  // Read tensor count from header
+  uint32_t total_tensors = read_u32(f);
+
+  // Allocate and initialize stream reader
+  BinStreamReader* reader = (BinStreamReader*)malloc(sizeof(BinStreamReader));
+  if (!reader) {
+    fprintf(stderr, "Failed to allocate stream reader\n");
+    fclose(f);
+    return NULL;
+  }
+
+  reader->file = f;
+  reader->total_bytes = total_bytes;
+  reader->bytes_read = ftell(f);  // Current position after header
+  reader->file_version = file_version;
+  reader->total_tensors = total_tensors;
+  reader->tensors_read = 0;
+
+  return reader;
+}
+
+/**
+ * Read the next tensor from a streaming binary file
+ * 
+ * @param reader The stream reader instance
+ * @param tensor Tensor structure to populate (caller must free tensor data)
+ * @return 1 if tensor read successfully, 0 if EOF reached, -1 on error
+ * 
+ * This function reads one tensor from the stream, allocating memory for
+ * tensor data. The caller is responsible for freeing tensor->name, 
+ * tensor->shape, and tensor->data when done.
+ */
+int bin_stream_reader_next_tensor(BinStreamReader* reader, TensorBin* tensor) {
+  if (!reader || !reader->file || !tensor) {
+    return -1;
+  }
+
+  FILE* f = reader->file;
+
+  // Try to read name length - if EOF, we're done
+  uint32_t name_len;
+  if (fread(&name_len, sizeof(uint32_t), 1, f) != 1) {
+    if (feof(f)) {
+      return 0;  // EOF reached normally
+    }
+    return -1;  // Read error
+  }
+
+  // Read tensor name
+  tensor->name = (char*)xmalloc(name_len + 1);
+  read_exact(f, tensor->name, name_len);
+  tensor->name[name_len] = 0;
+
+  // Read tensor metadata
+  tensor->dtype = (int)read_u32(f);   // 0=f32, 1=f16, 2=i8, 3=i4
+  tensor->ndim = (int)read_u32(f);
+
+  // Read tensor shape
+  tensor->shape = (int*)xmalloc(sizeof(int) * tensor->ndim);
+  size_t elems = 1;
+  for (int d = 0; d < tensor->ndim; ++d) {
+    tensor->shape[d] = (int)read_u32(f);
+    elems *= (size_t)tensor->shape[d];
+  }
+
+  // Calculate tensor data size
+  size_t bpe;
+  switch (tensor->dtype) {
+    case 0: bpe = 4; break; // f32
+    case 1: bpe = 2; break; // f16
+    case 2: bpe = 1; break; // i8
+    case 3: bpe = 1; break; // i4 (packed)
+    default:
+      fprintf(stderr, "Unknown dtype %d\n", tensor->dtype);
+      free(tensor->name);
+      free(tensor->shape);
+      return -1;
+  }
+
+  tensor->nbytes = elems * bpe;
+  tensor->data = xmalloc(tensor->nbytes);
+  read_exact(f, tensor->data, tensor->nbytes);
+
+  // Read group_size for v2 files (0 for v1 files)
+  if (reader->file_version >= 2) {
+    tensor->group_size = (size_t)read_u32(f);
+  } else {
+    tensor->group_size = 0; // Default for v1 files
+  }
+
+  // Update streaming state
+  reader->tensors_read++;
+  reader->bytes_read = ftell(f);
+
+  return 1; // Successfully read tensor
+}
+
+/**
+ * Close a streaming binary file reader and free resources
+ * 
+ * @param reader The stream reader instance to close
+ */
+void bin_stream_reader_close(BinStreamReader* reader) {
+  if (!reader) return;
+  
+  if (reader->file) {
+    fclose(reader->file);
+  }
+  free(reader);
+}
+
+/**
+ * Open a binary file for streaming tensor writing
+ * 
+ * @param path Path to the output binary file
+ * @return BinStreamWriter* on success, NULL on failure
+ * 
+ * This function creates a new binary file and writes the header.
+ * The tensor count will be updated when the file is finalized.
+ */
+BinStreamWriter* bin_stream_writer_open(const char* path) {
+  FILE* f = fopen(path, "wb");
+  if (!f) {
+    perror(path);
+    return NULL;
+  }
+
+  // Write magic header (v2 format for group_size support)
+  const unsigned char magic[6] = { 'Q','W','3','W',0x00,0x02 };
+  if (fwrite(magic, 1, 6, f) != 6) {
+    perror("Failed to write magic header");
+    fclose(f);
+    return NULL;
+  }
+
+  // Write placeholder tensor count (will be updated on finalize)
+  uint32_t placeholder_count = 0;
+  if (fwrite(&placeholder_count, sizeof(uint32_t), 1, f) != 1) {
+    perror("Failed to write tensor count placeholder");
+    fclose(f);
+    return NULL;
+  }
+
+  // Allocate and initialize stream writer
+  BinStreamWriter* writer = (BinStreamWriter*)malloc(sizeof(BinStreamWriter));
+  if (!writer) {
+    fprintf(stderr, "Failed to allocate stream writer\n");
+    fclose(f);
+    return NULL;
+  }
+
+  writer->file = f;
+  writer->file_version = 2;  // Always write v2 format for group_size support
+  writer->tensor_count = 0;
+
+  return writer;
+}
+
+/**
+ * Write a tensor to the streaming output file
+ * 
+ * @param writer The stream writer instance
+ * @param tensor The tensor to write
+ * @return 0 on success, -1 on error
+ */
+int bin_stream_writer_write_tensor(BinStreamWriter* writer, const TensorBin* tensor) {
+  if (!writer || !writer->file || !tensor) {
+    return -1;
+  }
+
+  FILE* f = writer->file;
+
+  // Write tensor name
+  uint32_t name_len = (uint32_t)strlen(tensor->name);
+  if (fwrite(&name_len, sizeof(uint32_t), 1, f) != 1) return -1;
+  if (fwrite(tensor->name, 1, name_len, f) != name_len) return -1;
+
+  // Write tensor metadata
+  uint32_t dtype = (uint32_t)tensor->dtype;
+  uint32_t ndim = (uint32_t)tensor->ndim;
+  if (fwrite(&dtype, sizeof(uint32_t), 1, f) != 1) return -1;
+  if (fwrite(&ndim, sizeof(uint32_t), 1, f) != 1) return -1;
+
+  // Write tensor shape
+  for (int i = 0; i < tensor->ndim; i++) {
+    uint32_t dim = (uint32_t)tensor->shape[i];
+    if (fwrite(&dim, sizeof(uint32_t), 1, f) != 1) return -1;
+  }
+
+  // Write tensor data
+  if (fwrite(tensor->data, 1, tensor->nbytes, f) != tensor->nbytes) return -1;
+
+  // Write group_size (v2 format)
+  uint32_t group_size = (uint32_t)tensor->group_size;
+  if (fwrite(&group_size, sizeof(uint32_t), 1, f) != 1) return -1;
+
+  writer->tensor_count++;
+  return 0;
+}
+
+/**
+ * Finalize the streaming output file by updating the tensor count in header
+ * 
+ * @param writer The stream writer instance
+ * @return 0 on success, -1 on error
+ */
+int bin_stream_writer_finalize(BinStreamWriter* writer) {
+  if (!writer || !writer->file) {
+    return -1;
+  }
+
+  // Save current position
+  long current_pos = ftell(writer->file);
+  if (current_pos == -1) {
+    perror("Failed to get current file position");
+    return -1;
+  }
+
+  // Seek to tensor count position (after magic header)
+  if (fseek(writer->file, 6, SEEK_SET) != 0) {
+    perror("Failed to seek to tensor count position");
+    return -1;
+  }
+
+  // Write actual tensor count
+  uint32_t count = writer->tensor_count;
+  if (fwrite(&count, sizeof(uint32_t), 1, writer->file) != 1) {
+    perror("Failed to write final tensor count");
+    return -1;
+  }
+
+  // Return to end of file
+  if (fseek(writer->file, current_pos, SEEK_SET) != 0) {
+    perror("Failed to return to end of file");
+    return -1;
+  }
+
+  return 0;
+}
+
+/**
+ * Close a streaming binary file writer and free resources
+ * 
+ * @param writer The stream writer instance to close
+ */
+void bin_stream_writer_close(BinStreamWriter* writer) {
+  if (!writer) return;
+  
+  if (writer->file) {
+    fclose(writer->file);
+  }
+  free(writer);
 }
 

@@ -1,3 +1,24 @@
+/**
+ * quant.c - Implementation of Quantization Algorithms
+ * 
+ * This file implements the core quantization algorithms for MoE expert weights.
+ * It provides both rowwise and group-wise quantization for Q8 and Q4 formats.
+ * 
+ * Quantization Process:
+ * 1. Analyze input tensor to determine optimal scaling factors
+ * 2. Apply quantization formula to convert FP32 -> int8/int4
+ * 3. Pack Q4 values efficiently (2 values per byte)
+ * 4. Store scaling factors separately for dequantization
+ * 
+ * Mathematical Foundation:
+ * - Q8: value_fp32 ≈ value_int8 * scale, where scale = max_abs_value / 127
+ * - Q4: value_fp32 ≈ (value_uint4 - 8) * scale, where scale = max_abs_value / 7
+ * 
+ * Group-wise quantization divides the tensor into groups of configurable size,
+ * with each group sharing a scaling factor. This provides better compression
+ * and accuracy trade-offs compared to rowwise quantization.
+ */
+
 #include "quant.h"
 #include "io.h"
 #include <stdlib.h>
@@ -115,17 +136,129 @@ size_t get_quantized_data_size(size_t rows, size_t cols, QuantType qtype) {
 }
 
 /**
- * Calculate size needed for scaling factors (one float per row)
+ * Calculate the number of groups for given tensor dimensions and group size
  */
-size_t get_scales_size(size_t rows) {
-    return rows * sizeof(float);
+size_t get_num_groups(size_t rows, size_t cols, size_t group_size) {
+    if (group_size == 0) {
+        // Rowwise quantization: one scale per row
+        return rows;
+    } else {
+        // Group-wise quantization: groups span across the tensor
+        size_t total_elements = rows * cols;
+        return (total_elements + group_size - 1) / group_size; // Ceiling division
+    }
+}
+
+/**
+ * Calculate size needed for scaling factors
+ */
+size_t get_scales_size(size_t rows, size_t cols, size_t group_size) {
+    return get_num_groups(rows, cols, group_size) * sizeof(float);
+}
+
+/**
+ * Group-wise Q8 quantization implementation
+ * Quantizes tensor in groups of specified size with shared scaling factors per group
+ */
+void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t group_size,
+                          float* out_scales, int8_t* out_quantized, size_t* out_num_groups) {
+    size_t total_elements = rows * cols;
+    size_t num_groups = get_num_groups(rows, cols, group_size);
+    *out_num_groups = num_groups;
+    
+    for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
+        size_t start_idx = group_idx * group_size;
+        size_t end_idx = start_idx + group_size;
+        if (end_idx > total_elements) end_idx = total_elements;
+        
+        // Find maximum absolute value in this group
+        float max_abs = 0.0f;
+        for (size_t idx = start_idx; idx < end_idx; idx++) {
+            float abs_val = fabsf(input[idx]);
+            if (abs_val > max_abs) {
+                max_abs = abs_val;
+            }
+        }
+        
+        // Calculate scaling factor
+        float scale = fmaxf(max_abs / 127.0f, 1e-8f);
+        out_scales[group_idx] = scale;
+        
+        // Quantize values in this group
+        for (size_t idx = start_idx; idx < end_idx; idx++) {
+            float normalized = input[idx] / scale;
+            int8_t quantized = (int8_t)roundf(normalized);
+            out_quantized[idx] = quantized;
+        }
+    }
+}
+
+/**
+ * Group-wise Q4 quantization implementation
+ * Quantizes tensor in groups of specified size with shared scaling factors per group
+ */
+void quantize_groupwise_q4(const float* input, size_t rows, size_t cols, size_t group_size,
+                          float* out_scales, uint8_t* out_quantized, size_t* out_num_groups) {
+    size_t total_elements = rows * cols;
+    size_t num_groups = get_num_groups(rows, cols, group_size);
+    *out_num_groups = num_groups;
+    
+    for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
+        size_t start_idx = group_idx * group_size;
+        size_t end_idx = start_idx + group_size;
+        if (end_idx > total_elements) end_idx = total_elements;
+        
+        // Find maximum absolute value in this group
+        float max_abs = 0.0f;
+        for (size_t idx = start_idx; idx < end_idx; idx++) {
+            float abs_val = fabsf(input[idx]);
+            if (abs_val > max_abs) {
+                max_abs = abs_val;
+            }
+        }
+        
+        // Calculate scaling factor for 4-bit range [-8, 7]
+        float scale = fmaxf(max_abs / 7.0f, 1e-8f);
+        out_scales[group_idx] = scale;
+        
+        // Quantize and pack values in this group
+        for (size_t idx = start_idx; idx < end_idx; idx++) {
+            float normalized = input[idx] / scale;
+            // Clamp to Q4 range [-8, 7] and round to nearest integer
+            int8_t quantized = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(normalized)));
+            
+            // Q4 packing: Store 2 values per byte in nibble format
+            // Challenge: Groups may not align with byte boundaries, so we pack
+            // values back into their original matrix positions for row-major layout
+            
+            // Convert linear index back to 2D coordinates
+            size_t row = idx / cols;
+            size_t col = idx % cols;
+            size_t packed_cols = (cols + 1) / 2;  // Number of bytes needed per row
+            size_t pack_idx = col / 2;            // Which byte in the row
+            
+            // Shift signed [-8,7] to unsigned [0,15] for storage
+            uint8_t packed_val = (uint8_t)(quantized + 8);
+            
+            // Pack into appropriate nibble (4-bit half) of the byte
+            if (col % 2 == 0) {
+                // Store in low nibble (bits 0-3)
+                out_quantized[row * packed_cols + pack_idx] = 
+                    (out_quantized[row * packed_cols + pack_idx] & 0xF0) | (packed_val & 0x0F);
+            } else {
+                // Store in high nibble (bits 4-7)
+                out_quantized[row * packed_cols + pack_idx] = 
+                    (out_quantized[row * packed_cols + pack_idx] & 0x0F) | ((packed_val & 0x0F) << 4);
+            }
+        }
+    }
 }
 
 /**
  * Quantize a tensor using the specified quantization type
  * Creates separate quantized data and scaling factor arrays
  */
-QuantizedTensor* quantize_tensor(const TensorBin* tensor, QuantType qtype) {
+QuantizedTensor* quantize_tensor(const TensorBin* tensor, QuantType qtype, size_t group_size) {
     if (!tensor || !tensor->data || tensor->ndim != 2) {
         fprintf(stderr, "Error: quantize_tensor requires 2D tensor\n");
         return NULL;
@@ -149,10 +282,12 @@ QuantizedTensor* quantize_tensor(const TensorBin* tensor, QuantType qtype) {
     
     qt->num_rows = rows;
     qt->row_size = cols;
+    qt->group_size = group_size;
+    qt->num_groups = get_num_groups(rows, cols, group_size);
     qt->qtype = qtype;
     
-    // Allocate scaling factors (one per row)
-    qt->scales = (float*)malloc(get_scales_size(rows));
+    // Allocate scaling factors
+    qt->scales = (float*)malloc(get_scales_size(rows, cols, group_size));
     if (!qt->scales) {
         fprintf(stderr, "Error: Failed to allocate scaling factors\n");
         free(qt);
@@ -170,19 +305,44 @@ QuantizedTensor* quantize_tensor(const TensorBin* tensor, QuantType qtype) {
     }
     
     // Perform quantization
-    switch (qtype) {
-        case QUANT_Q8:
-            quantize_rowwise_q8(input_data, rows, cols, qt->scales, (int8_t*)qt->q_data);
-            break;
-        case QUANT_Q4:
-            quantize_rowwise_q4(input_data, rows, cols, qt->scales, (uint8_t*)qt->q_data);
-            break;
-        default:
-            fprintf(stderr, "Error: Unsupported quantization type %d\n", qtype);
-            free(qt->q_data);
-            free(qt->scales);
-            free(qt);
-            return NULL;
+    if (group_size == 0) {
+        // Use rowwise quantization (backward compatibility)
+        switch (qtype) {
+            case QUANT_Q8:
+                quantize_rowwise_q8(input_data, rows, cols, qt->scales, (int8_t*)qt->q_data);
+                break;
+            case QUANT_Q4:
+                quantize_rowwise_q4(input_data, rows, cols, qt->scales, (uint8_t*)qt->q_data);
+                break;
+            default:
+                fprintf(stderr, "Error: Unsupported quantization type %d\n", qtype);
+                free(qt->q_data);
+                free(qt->scales);
+                free(qt);
+                return NULL;
+        }
+    } else {
+        // Use group-wise quantization
+        size_t num_groups_out;
+        switch (qtype) {
+            case QUANT_Q8:
+                quantize_groupwise_q8(input_data, rows, cols, group_size, 
+                                     qt->scales, (int8_t*)qt->q_data, &num_groups_out);
+                break;
+            case QUANT_Q4:
+                // Initialize packed data to zero first
+                memset(qt->q_data, 0, q_data_size);
+                quantize_groupwise_q4(input_data, rows, cols, group_size,
+                                     qt->scales, (uint8_t*)qt->q_data, &num_groups_out);
+                break;
+            default:
+                fprintf(stderr, "Error: Unsupported quantization type %d\n", qtype);
+                free(qt->q_data);
+                free(qt->scales);
+                free(qt);
+                return NULL;
+        }
+        qt->num_groups = num_groups_out;
     }
     
     return qt;
