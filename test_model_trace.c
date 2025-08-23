@@ -34,6 +34,7 @@
 
 #include "model.h"
 #include "io.h"     // bin_load / bin_find / npy_load_* already available
+#include "io_mmap.h"
 #include "utils.h"  // max_abs_diff, etc.
 #include "kernels.h" // matmul_adaptive for quantized weights
 
@@ -521,28 +522,111 @@ static void layer_forward_f32(
 }
 
 //==============================
+// QwenStates: All intermediate state allocations
+//==============================
+// Similar to llama2.c RunState, this struct contains all temporary buffers
+// needed during model forward pass, allocated once and reused across steps
+typedef struct {
+  // Main activation buffers - store intermediate layer outputs
+  float* x;           // [T, d_model] - primary activation buffer, flows through all layers
+  float* x_final;     // [T, d_model] - buffer for final RMSNorm output before lm_head
+  
+  // Attention computation scratch space
+  // Size calculation: T*(Dq + 2*Dkv) + T*T + T*Dq + 4*T*d_model
+  // Where: Dq = n_q * head_dim, Dkv = n_kv * head_dim
+  // Layout: [Q: T*Dq] + [K: T*Dkv] + [V: T*Dkv] + [S: T*T] + [Hcat: T*Dq] + [temps: 4*T*d_model]
+  // Q/K/V: projected query/key/value matrices for all heads
+  // S: attention scores matrix [seq_len, seq_len] for softmax computation  
+  // Hcat: concatenated head outputs before output projection
+  // temps: temporary buffers for norm1/attn_out/x_after/norm2 in layer_forward_f32
+  float* scratch_attn;
+  
+  // MoE (Mixture of Experts) computation scratch space  
+  // Size: T * n_experts + T * d_model
+  // Layout: [router_logits: T*n_experts] + [moe_output: T*d_model]
+  // router_logits: expert selection scores for each token
+  // moe_output: accumulated weighted expert outputs
+  float* scratch_moe;
+  
+  // Top-K selection buffers for MoE routing
+  int* tmp_idx;       // [top_k] - indices of selected experts per token
+  float* tmp_val;     // [top_k] - corresponding expert weights after softmax
+  
+  // Final output buffer
+  float* out_logits;  // [vocab_size] - logits for next token prediction
+} QwenStates;
+
+// Allocate all intermediate states once - prevents repeated malloc/free in forward passes
+// This matches the llama2.c pattern where RunState is allocated once in main()
+static QwenStates* malloc_qwen_states(const QwenConfig* cfg, int T) {
+  QwenStates* s = (QwenStates*)calloc(1, sizeof(QwenStates));
+  if (!s) return NULL;
+  
+  const int D = cfg->d_model;           // model dimension (e.g., 4096)
+  const int V = cfg->vocab_size;        // vocabulary size (e.g., 32000)
+  const int Dq0  = cfg->n_q  * cfg->head_dim;  // total query dimension across all heads
+  const int Dkv0 = cfg->n_kv * cfg->head_dim;  // total key/value dimension (GQA: n_kv <= n_q)
+  
+  // Attention scratch calculation breakdown:
+  // - Q matrix: T * Dq0 floats
+  // - K matrix: T * Dkv0 floats  
+  // - V matrix: T * Dkv0 floats
+  // - Attention scores S: T * T floats (seq_len x seq_len attention matrix)
+  // - Head concatenation Hcat: T * Dq0 floats
+  // - Layer temps: 4 * T * D floats (x_norm1, attn_out, x_after, x_norm2)
+  size_t attn_f  = (size_t)T*(Dq0 + 2*Dkv0) + (size_t)T*T + (size_t)T*Dq0;
+  size_t temps_f = 4ull * (size_t)T * D;
+  
+  // MoE scratch calculation:
+  // - Router logits: T * n_experts floats (expert scores for each token)
+  // - MoE output accumulator: T * d_model floats
+  size_t moe_f = (size_t)T * cfg->n_experts + (size_t)T * D;
+  
+  // Allocate all buffers with zero initialization
+  s->x = (float*)calloc((size_t)T * D, sizeof(float));
+  s->x_final = (float*)calloc((size_t)T * D, sizeof(float));
+  s->scratch_attn = (float*)calloc(attn_f + temps_f, sizeof(float));
+  s->scratch_moe = (float*)calloc(moe_f, sizeof(float));
+  s->tmp_idx = (int*)calloc(cfg->top_k, sizeof(int));
+  s->tmp_val = (float*)calloc(cfg->top_k, sizeof(float));
+  s->out_logits = (float*)calloc(V, sizeof(float));
+  
+  // Verify all allocations succeeded - if any fail, clean up and return NULL
+  if (!s->x || !s->x_final || !s->scratch_attn || !s->scratch_moe || 
+      !s->tmp_idx || !s->tmp_val || !s->out_logits) {
+    free(s->x); free(s->x_final); free(s->scratch_attn); free(s->scratch_moe);
+    free(s->tmp_idx); free(s->tmp_val); free(s->out_logits);
+    free(s);
+    return NULL;
+  }
+  
+  return s;
+}
+
+// Free all intermediate state buffers
+static void free_qwen_states(QwenStates* s) {
+  if (!s) return;
+  free(s->x); free(s->x_final); free(s->scratch_attn); free(s->scratch_moe);
+  free(s->tmp_idx); free(s->tmp_val); free(s->out_logits);
+  free(s);
+}
+
+//==============================
 // Full forward (no file I/O)
 //==============================
 static void model_forward_f32(
   const int* ids, int T,
   const QwenConfig* cfg,
   const QwenWeights* w,
+  QwenStates* s,      // pre-allocated intermediate state buffers
   int apply_softmax,
-  float* out_last // [1, vocab]
+  float* out_last     // [1, vocab] - output buffer for final logits
 ){
   PROF_START("model_forward T=%d", T);
   const int D = cfg->d_model, V = cfg->vocab_size, L = cfg->n_layers;
-  const int Dq0  = cfg->n_q  * cfg->head_dim;
-  const int Dkv0 = cfg->n_kv * cfg->head_dim;
 
-  size_t attn_f  = (size_t)T*(Dq0 + 2*Dkv0) + (size_t)T*T + (size_t)T*Dq0;
-  size_t temps_f = 4ull * (size_t)T * D;
-  float* scratch_attn = (float*)malloc(sizeof(float)*(attn_f + temps_f));
-  float* scratch_moe  = (float*)malloc(sizeof(float)*((size_t)T*cfg->n_experts + (size_t)T*D));
-  int*   tmp_idx      = (int*)  malloc(sizeof(int)*cfg->top_k);
-  float* tmp_val      = (float*)malloc(sizeof(float)*cfg->top_k);
-
-  float* x = (float*)malloc(sizeof(float)*(size_t)T*D);
+  // Use pre-allocated buffers from QwenStates instead of malloc/free
+  float* x = s->x;
 
   // embeddings
   PROF_START("embedding_lookup T=%d D=%d", T, D);
@@ -559,12 +643,12 @@ static void model_forward_f32(
       cfg->n_q, cfg->n_kv, cfg->head_dim, cfg->causal,
       cfg->rope_theta, cfg->rms_eps,
       cfg->n_experts, cfg->top_k, cfg->d_ff,
-      scratch_attn, scratch_moe, tmp_idx, tmp_val
+      s->scratch_attn, s->scratch_moe, s->tmp_idx, s->tmp_val
     );
   }
 
   // final norm + head (only last row into out_last)
-  float* x_final = (float*)malloc(sizeof(float)*(size_t)T*D);
+  float* x_final = s->x_final;  // use pre-allocated buffer
   rmsnorm_forward_f32(x, w->final_norm_w, T, D, cfg->rms_eps, x_final);
 
   const float* Wout = w->lm_head ? w->lm_head : w->tok_emb;
@@ -572,17 +656,15 @@ static void model_forward_f32(
 
   if (apply_softmax) softmax_rows(out_last, 1, V);
 
-  free(x_final);
-  free(x);
-  free(scratch_attn); free(scratch_moe); free(tmp_idx); free(tmp_val);
+  // No free() calls - buffers are reused across forward passes
   PROF_ENDF();
 }
 
 //==============================
 // Weight loading (external)
 //==============================
-// Expect: void load_all_weights(BinFile*, QwenConfig*, QwenWeights*);
-// Provided elsewhere in your project.
+// Expect: void load_all_weights(BinFile*, QwenConfig*, QwenWeights*, int use_mmap);
+// Provided in model.h with detailed memory mapping and explicit loading support.
 
 //==============================
 // Simple argument parser
@@ -593,22 +675,31 @@ typedef struct {
   int   steps;            // how many generation steps to evaluate
   int   prompt_len_opt;   // 0 if not specified; else a positive value
   int   prompt_len;       // resolved prompt length
+  int   use_mmap;         // 1 = use mmap (default), 0 = explicit loading
 } Args;
 
 static void usage(const char* prog){
   fprintf(stderr,
     "Usage:\n"
-    "  %s <all.bin> <outbase> <steps> [--prompt_len P]\n"
-    "  %s <all.bin> <outbase> --steps N [--prompt_len P]\n"
+    "  %s <all.bin> <outbase> <steps> [OPTIONS]\n"
+    "  %s <all.bin> <outbase> --steps N [OPTIONS]\n"
+    "\nOptions:\n"
+    "  --prompt_len P    Set explicit prompt length (default: auto-calculated)\n"
+    "  --no-mmap         Load weights into memory instead of memory mapping (default: use mmap)\n"
     "\nNotes:\n"
-    "  • If --prompt_len is not given, defaults to IDS_len - steps (clamped to >=1).\n"
-    "  • If --prompt_len is given, steps will be clamped so prompt_len + steps <= IDS_len.\n",
+    "  • Weights are memory-mapped by default for better performance and lower memory usage\n"
+    "  • Use --no-mmap to explicitly load weights into allocated memory (shows progress)\n"
+    "  • If --prompt_len is not given, defaults to IDS_len - steps (clamped to >=1)\n"
+    "  • If --prompt_len is given, steps will be clamped so prompt_len + steps <= IDS_len\n",
     prog, prog);
 }
 
 static int parse_args(int argc, char** argv, Args* a){
   if (argc < 2) { usage(argv[0]); return -1; }
   memset(a, 0, sizeof(*a));
+  
+  // Set defaults
+  a->use_mmap = 1;  // Use mmap by default
 
   // First pass: collect positional if present
   int pos = 0;
@@ -625,6 +716,7 @@ static int parse_args(int argc, char** argv, Args* a){
     const char* s = argv[i];
     if (strcmp(s,"--steps")==0 && i+1<argc) { a->steps = atoi(argv[++i]); continue; }
     if (strcmp(s,"--prompt_len")==0 && i+1<argc) { a->prompt_len_opt = 1; a->prompt_len = atoi(argv[++i]); continue; }
+    if (strcmp(s,"--no-mmap")==0) { a->use_mmap = 0; continue; }
   }
 
   if (!a->allfile || !a->outbase || a->steps <= 0) {
@@ -634,6 +726,7 @@ static int parse_args(int argc, char** argv, Args* a){
   return 0;
 }
 
+//#define MMAP
 //==============================
 // Main
 //==============================
@@ -642,11 +735,16 @@ int main(int argc, char** argv) {
   if (parse_args(argc, argv, &args) != 0) return 1;
 
   // Load the model weights from the binary file
+#ifdef MMAP
+  BinFile* bin_file = bin_load_mmap(args.allfile);
+#else
   BinFile* bin_file = bin_load(args.allfile);
+#endif
   if (!bin_file) { fprintf(stderr, "Failed to load binary file\n"); return 1; }
 
   QwenConfig config;
   QwenWeights weights;
+  printf("[loading] weights mode: %s\n", args.use_mmap ? "memory-mapped" : "explicit loading");
   load_all_weights(bin_file, &config, &weights);
   printf("[model] d_model=%d n_layers=%d head_dim=%d n_q=%d n_kv=%d vocab=%d\n",
          config.d_model, config.n_layers, config.head_dim, config.n_q, config.n_kv, config.vocab_size);
@@ -701,25 +799,37 @@ int main(int argc, char** argv) {
 
   printf("[run] seq_len=%d prompt_len=%d steps=%d\n", seq_len, prompt_len, steps);
 
+  // Allocate QwenStates once for the maximum sequence length we'll process
+  // This follows the llama2.c pattern of allocating RunState in main()
+  int max_seq_len = prompt_len + steps;
+  QwenStates* qwen_states = malloc_qwen_states(&config, max_seq_len);
+  if (!qwen_states) {
+    fprintf(stderr, "Failed to allocate QwenStates\n");
+    return 1;
+  }
+
   float* last_logits = (float*)malloc(sizeof(float) * vocab_size);
 
+  // Run model forward for all steps at once - similar to llama2.c approach
+  // where forward() processes the entire sequence and generates multiple tokens
+  #ifdef BENCH
+    double total_ms = 0.0;
+    TIMER_DECL;
+    TIMER_START();
+  #endif
+
+  // Process each step individually but reuse the same QwenStates
   for (int step = 0; step < steps; ++step) {
     // Compute the current input length: prompt + previously "generated" tokens (from reference)
     int input_len = prompt_len + step;
 
-    #ifdef BENCH
-      double ms = 0.0;
-    #endif
-      DBG("[model_forward_f32] step=%d\n ", step);
-    #ifdef BENCH
-      TIMER_DECL;
-      TIMER_START();
-    #endif
+    DBG("[model_forward_f32] step=%d input_len=%d\n", step, input_len);
 
     // Run model forward on the prefix tokens[0..input_len-1], get logits for the next token
+    // Now uses pre-allocated QwenStates instead of allocating buffers each time
     model_forward_f32(
       ref_tokens->data, input_len,
-      &config, &weights,
+      &config, &weights, qwen_states,
       /*apply_softmax=*/0,
       last_logits
     );
@@ -747,19 +857,24 @@ int main(int argc, char** argv) {
 
     printf("[step %d] logits MAD=%.8g  probs MAD=%.8g  argmax=%d  ref=%d\n",
            step, max_abs_diff_logits, max_abs_diff_probs, argmax_model, argmax_ref);
-    TIMER_END_MS(ms);
-    #ifdef BENCH
-      DBG("[model_forward] done in %.3f ms, %.3f t/s\n", ms, 1e3 / ms);
-    #else
-      DBG("[model_forward] done\n");
-    #endif
   }
 
+  #ifdef BENCH
+    TIMER_END_MS(total_ms);
+    DBG("[total] %d steps in %.3f ms, %.3f ms/step, %.3f steps/s\n", 
+        steps, total_ms, total_ms/steps, 1e3*steps/total_ms);
+  #endif
+
+  // Clean up allocated resources
+  free_qwen_states(qwen_states);  // Free all intermediate state buffers
   free(last_logits);
   npy_free_i32(ref_tokens);
   npy_free(ref_logits);
   npy_free(ref_probs);
 
+#ifdef MMAP
+  bin_free_mmap(bin_file);
+#else
   // Free layer expert arrays
   for (int layer = 0; layer < config.n_layers; ++layer) {
     free((void*)weights.layers[layer].Wg);
@@ -768,6 +883,7 @@ int main(int argc, char** argv) {
   }
   free(weights.layers);
   bin_free(bin_file);
+#endif
   return 0;
 }
 

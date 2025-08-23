@@ -62,8 +62,43 @@
  * @param out_quantized: Output buffer for quantized data [rows * cols]
  * @param out_num_groups: Output parameter for total number of groups created
  */
-void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t group_size,
-                          float* out_scales, int8_t* out_quantized, size_t* out_num_groups) {
+void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t GS, float* out_scales, int8_t* out_quantized, size_t* out_num_groups) {
+
+  size_t n = rows * cols;
+  size_t num_groups = n / GS;
+  float Q_MAX = 127.0f;
+  *out_num_groups = num_groups;
+
+  for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
+
+    size_t start_idx = group_idx * GS;
+    size_t end_idx = start_idx + GS;
+    if (end_idx > n) end_idx = n;
+
+    // Find maximum absolute value in this group for optimal scaling
+    float max_abs = 0.0f;
+    for (size_t idx = start_idx; idx < end_idx; idx++) {
+      float abs_val = fabsf(input[idx]);
+      if (abs_val > max_abs) {
+        max_abs = abs_val;
+      }
+    }
+
+    // Calculate scaling factor (Q8 range: [-127, 127])
+    float scale = fmaxf(max_abs / Q_MAX, 1e-8f);
+    out_scales[group_idx] = scale;
+
+    // Quantize values in this group
+    for (size_t idx = start_idx; idx < end_idx; idx++) {
+      float normalized = input[idx] / scale;
+      int8_t quantized = (int8_t)roundf(normalized);
+      out_quantized[idx] = quantized;
+    }
+  }
+}
+/* legacy
+void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t group_size, float* out_scales, int8_t* out_quantized, size_t* out_num_groups) {
+
   size_t total_elements = rows * cols;
   size_t num_groups = get_num_groups(rows, cols, group_size);
   *out_num_groups = num_groups;
@@ -94,7 +129,7 @@ void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t 
     }
   }
 }
-
+*/
 /**
  * Group-wise Q4 quantization implementation
  * Quantizes tensor in groups with shared scaling factors, then packs into nibbles

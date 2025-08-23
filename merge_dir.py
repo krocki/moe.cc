@@ -8,7 +8,7 @@ try:
 except Exception:
   _HAS_TQDM = False
 
-MAGIC = b"QW3W\x00\x01"
+MAGIC = b"QW3W\x00\x02"
 
 def read_one_tensor(path: str) -> bytes:
   with open(path, "rb") as f:
