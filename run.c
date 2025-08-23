@@ -32,6 +32,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <getopt.h>
 
 #include "model.h"
 #include "io.h"
@@ -39,6 +40,7 @@
 #include "utils.h"
 #include "kernels.h"
 #include "debug_utils.h"
+#include "tokenizer.h"
 
 // ----------------------------------------------------------------------------
 // QwenStates: Pre-allocated intermediate computation buffers
@@ -956,6 +958,160 @@ int argmax(float* logits, int vocab_size) {
 }
 
 /**
+ * Sample token using multinomial distribution from probabilities
+ *
+ * @param probabilities: Probability distribution [vocab_size]
+ * @param vocab_size: Size of vocabulary
+ * @return: Sampled token ID
+ */
+int sample_multinomial(float* probabilities, int vocab_size) {
+  float r = (float)rand() / RAND_MAX;
+  float cumulative_prob = 0.0f;
+  
+  for (int i = 0; i < vocab_size; i++) {
+    cumulative_prob += probabilities[i];
+    if (r < cumulative_prob) {
+      return i;
+    }
+  }
+  
+  return vocab_size - 1; // fallback to last token
+}
+
+/**
+ * Apply temperature scaling to logits
+ *
+ * @param logits: Model logits [vocab_size]
+ * @param vocab_size: Size of vocabulary
+ * @param temperature: Temperature parameter (1.0 = no change, <1.0 = sharper, >1.0 = smoother)
+ */
+void apply_temperature(float* logits, int vocab_size, float temperature) {
+  if (temperature == 1.0f) return;
+  
+  for (int i = 0; i < vocab_size; i++) {
+    logits[i] /= temperature;
+  }
+}
+
+/**
+ * Convert logits to probabilities using softmax for sampling
+ *
+ * @param logits: Input logits [vocab_size]
+ * @param probabilities: Output probabilities [vocab_size]
+ * @param vocab_size: Size of vocabulary
+ */
+void softmax_sampling(float* logits, float* probabilities, int vocab_size) {
+  // Find max for numerical stability
+  float max_logit = logits[0];
+  for (int i = 1; i < vocab_size; i++) {
+    if (logits[i] > max_logit) {
+      max_logit = logits[i];
+    }
+  }
+  
+  // Compute exp and sum
+  float sum = 0.0f;
+  for (int i = 0; i < vocab_size; i++) {
+    probabilities[i] = expf(logits[i] - max_logit);
+    sum += probabilities[i];
+  }
+  
+  // Normalize
+  for (int i = 0; i < vocab_size; i++) {
+    probabilities[i] /= sum;
+  }
+}
+
+/**
+ * Probability-index pair for efficient sorting
+ */
+typedef struct {
+  float prob;
+  int idx;
+} ProbIdx;
+
+/**
+ * Quicksort comparison function for ProbIdx (descending order)
+ */
+int compare_prob_desc(const void* a, const void* b) {
+  const ProbIdx* pa = (const ProbIdx*)a;
+  const ProbIdx* pb = (const ProbIdx*)b;
+  if (pa->prob > pb->prob) return -1;
+  if (pa->prob < pb->prob) return 1;
+  return 0;
+}
+
+/**
+ * Fast top-p (nucleus) sampling using quicksort
+ *
+ * @param logits: Model logits [vocab_size]
+ * @param vocab_size: Size of vocabulary
+ * @param temperature: Temperature for scaling
+ * @param top_p: Cumulative probability threshold
+ * @return: Sampled token ID
+ */
+int sample_topp(float* logits, int vocab_size, float temperature, float top_p) {
+  // Apply temperature scaling
+  apply_temperature(logits, vocab_size, temperature);
+  
+  // Convert to probabilities and create prob-index pairs
+  ProbIdx* prob_idx = (ProbIdx*)malloc(vocab_size * sizeof(ProbIdx));
+  
+  // Find max for numerical stability
+  float max_logit = logits[0];
+  for (int i = 1; i < vocab_size; i++) {
+    if (logits[i] > max_logit) {
+      max_logit = logits[i];
+    }
+  }
+  
+  // Compute probabilities
+  float sum = 0.0f;
+  for (int i = 0; i < vocab_size; i++) {
+    prob_idx[i].prob = expf(logits[i] - max_logit);
+    prob_idx[i].idx = i;
+    sum += prob_idx[i].prob;
+  }
+  
+  // Normalize probabilities
+  for (int i = 0; i < vocab_size; i++) {
+    prob_idx[i].prob /= sum;
+  }
+  
+  // Sort by probability (descending) using quicksort
+  qsort(prob_idx, vocab_size, sizeof(ProbIdx), compare_prob_desc);
+  
+  // Find cutoff point for top-p
+  float cumulative_prob = 0.0f;
+  int cutoff = vocab_size;
+  
+  for (int i = 0; i < vocab_size; i++) {
+    cumulative_prob += prob_idx[i].prob;
+    if (cumulative_prob >= top_p) {
+      cutoff = i + 1;
+      break;
+    }
+  }
+  
+  // Sample from the top-p subset (already normalized)
+  float r = (float)rand() / RAND_MAX * cumulative_prob;
+  cumulative_prob = 0.0f;
+  int selected_token = prob_idx[cutoff - 1].idx; // fallback
+  
+  for (int i = 0; i < cutoff; i++) {
+    cumulative_prob += prob_idx[i].prob;
+    if (r < cumulative_prob) {
+      selected_token = prob_idx[i].idx;
+      break;
+    }
+  }
+  
+  free(prob_idx);
+  
+  return selected_token;
+}
+
+/**
  * Load reference data for testing (optional)
  * Loads .ids.npy, .logits.npy, .probs.npy files for comparison
  */
@@ -986,41 +1142,143 @@ int load_reference_data(const char* outbase, NpyArrayI32** ref_tokens,
 // ----------------------------------------------------------------------------
 
 void usage(char* argv0) {
-  printf("Usage: %s <model.bin> <steps> [outbase]\n", argv0);
+  printf("Qwen3-30B-A3B Inference Engine\n\n");
+  printf("Usage: %s [options]\n", argv0);
+  printf("       %s --model <model.bin> --tokenizer <tokenizer.bin> --prompt \"text\" --steps N\n", argv0);
+  printf("       %s <model.bin> <steps> [outbase]  # Legacy mode\n", argv0);
   printf("\n");
-  printf("Arguments:\n");
+  printf("Options:\n");
+  printf("  -m, --model <file>      Binary model file (FP32 only)\n");
+  printf("  -t, --tokenizer <file>  Tokenizer binary file\n");
+  printf("  -p, --prompt <text>     Input prompt to process\n");
+  printf("  -s, --steps <N>         Number of generation steps\n");
+  printf("  -S, --sample            Use probabilistic sampling instead of greedy argmax\n");
+  printf("  -T, --temperature <T>   Temperature for sampling (default: 1.0)\n");
+  printf("  -P, --top-p <P>         Top-p threshold for nucleus sampling (default: 0.9)\n");
+  printf("  -N, --no-timing         Disable timing statistics display\n");
+  printf("  -h, --help              Show this help message\n");
+  printf("\n");
+  printf("Legacy Arguments (deprecated):\n");
   printf("  model.bin  - Binary model file (FP32 only)\n");
   printf("  steps      - Number of inference steps to run\n");
   printf("  outbase    - Optional: base path for reference files (.ids.npy, .logits.npy, .probs.npy)\n");
   printf("\n");
   printf("Examples:\n");
-  printf("  %s all_q8.bin 10           # Generate 10 tokens\n", argv0);
-  printf("  %s all_q8.bin 5 q3_trace   # Run 5 steps, compare with q3_trace.*.npy\n", argv0);
+  printf("  # Basic generation:\n");
+  printf("  %s --model all_fp32.bin --tokenizer qwen3_tokenizer.bin --prompt \"Once upon a\" --steps 5\n", argv0);
+  printf("  %s -m all_fp32.bin -t qwen3_tokenizer.bin -p \"Hello world\" -s 10\n", argv0);
+  printf("\n");
+  printf("  # With sampling:\n");
+  printf("  %s -m all_fp32.bin -t qwen3_tokenizer.bin -p \"Tell me a story\" -s 20 --sample\n", argv0);
+  printf("  %s -m all_fp32.bin -t qwen3_tokenizer.bin -p \"Write code\" -s 10 -S -T 0.7 -P 0.95\n", argv0);
+  printf("\n");
+  printf("  # Legacy interface:\n");
+  printf("  %s all_fp32.bin 10                    # Generate 10 tokens with placeholder\n", argv0);
+  printf("  %s all_fp32.bin 5 q3_trace           # Run 5 steps, compare with q3_trace.*.npy\n", argv0);
 }
 
 int main(int argc, char** argv) {
   // Initialize debug system
   debug_init("debug_activations");
 
-  // Parse command line arguments
-  if (argc < 3) {
-    usage(argv[0]);
-    return 1;
-  }
+  // Command-line arguments
+  char* model_path = NULL;
+  char* tokenizer_path = NULL;
+  char* prompt = NULL;
+  int steps = 0;
+  char* outbase = NULL;  // Legacy mode only
+  int use_tokenizer = 0;
+  int use_sampling = 0;
+  float temperature = 1.0f;
+  float top_p = 0.95f;
+  int show_timing = 1;  // Show timing by default
 
-  char* model_path = argv[1];
-  int steps = atoi(argv[2]);
-  char* outbase = (argc >= 4) ? argv[3] : NULL;  // Optional
+  // Check if this is legacy mode (old interface: ./run model.bin steps [outbase])
+  if (argc >= 3 && argv[1][0] != '-') {
+    // Legacy mode
+    model_path = argv[1];
+    steps = atoi(argv[2]);
+    outbase = (argc >= 4) ? argv[3] : NULL;
+    
+    if (steps <= 0) {
+      fprintf(stderr, "Error: steps must be positive\n");
+      return 1;
+    }
+    
+    printf("Running in legacy mode (no tokenizer)\n");
+    printf("Loading model: %s\n", model_path);
+    printf("Running %d inference steps\n", steps);
+    if (outbase) {
+      printf("Comparing with reference: %s.*.npy\n", outbase);
+    }
+  } else {
+    // New command-line interface with getopt
+    static struct option long_options[] = {
+      {"model",       required_argument, 0, 'm'},
+      {"tokenizer",   required_argument, 0, 't'},
+      {"prompt",      required_argument, 0, 'p'},
+      {"steps",       required_argument, 0, 's'},
+      {"sample",      no_argument,       0, 'S'},
+      {"temperature", required_argument, 0, 'T'},
+      {"top-p",       required_argument, 0, 'P'},
+      {"no-timing",   no_argument,       0, 'N'},
+      {"help",        no_argument,       0, 'h'},
+      {0, 0, 0, 0}
+    };
 
-  if (steps <= 0) {
-    fprintf(stderr, "Error: steps must be positive\n");
-    return 1;
-  }
+    int c;
+    int option_index = 0;
+    
+    while ((c = getopt_long(argc, argv, "m:t:p:s:ST:P:Nh", long_options, &option_index)) != -1) {
+      switch (c) {
+        case 'm':
+          model_path = optarg;
+          break;
+        case 't':
+          tokenizer_path = optarg;
+          break;
+        case 'p':
+          prompt = optarg;
+          break;
+        case 's':
+          steps = atoi(optarg);
+          break;
+        case 'S':
+          use_sampling = 1;
+          break;
+        case 'T':
+          temperature = atof(optarg);
+          break;
+        case 'P':
+          top_p = atof(optarg);
+          break;
+        case 'N':
+          show_timing = 0;
+          break;
+        case 'h':
+          usage(argv[0]);
+          return 0;
+        case '?':
+          usage(argv[0]);
+          return 1;
+        default:
+          usage(argv[0]);
+          return 1;
+      }
+    }
 
-  printf("Loading model: %s\n", model_path);
-  printf("Running %d inference steps\n", steps);
-  if (outbase) {
-    printf("Comparing with reference: %s.*.npy\n", outbase);
+    // Validate required arguments for new interface
+    if (!model_path || !tokenizer_path || !prompt || steps <= 0) {
+      fprintf(stderr, "Error: Missing required arguments\n");
+      usage(argv[0]);
+      return 1;
+    }
+    
+    use_tokenizer = 1;
+    printf("Loading model: %s\n", model_path);
+    printf("Loading tokenizer: %s\n", tokenizer_path);
+    printf("Prompt: \"%s\"\n", prompt);
+    printf("Generation steps: %d\n", steps);
   }
 
   // Load model weights - use mmap for efficiency
@@ -1047,6 +1305,28 @@ int main(int argc, char** argv) {
       config.d_model, config.n_layers, config.n_q, config.n_kv,
       config.vocab_size, config.n_experts, config.top_k);
 
+  // Load tokenizer if using new interface
+  Tokenizer* tokenizer = NULL;
+  if (use_tokenizer) {
+    tokenizer = tokenizer_create();
+    if (!tokenizer) {
+      fprintf(stderr, "Failed to create tokenizer\n");
+      return 1;
+    }
+    
+    if (tokenizer_load(tokenizer, tokenizer_path) != 0) {
+      fprintf(stderr, "Failed to load tokenizer from: %s\n", tokenizer_path);
+      tokenizer_free(tokenizer);
+      return 1;
+    }
+    
+    printf("Tokenizer loaded: vocabulary size %d\n", tokenizer_vocab_size(tokenizer));
+    
+    int bos_id, eos_id, pad_id;
+    tokenizer_get_special_tokens(tokenizer, &bos_id, &eos_id, &pad_id);
+    printf("Special tokens: BOS=%d, EOS=%d, PAD=%d\n", bos_id, eos_id, pad_id);
+  }
+
   // Load reference data if provided
   NpyArrayI32* ref_tokens = NULL;
   NpyArray* ref_logits = NULL;
@@ -1062,54 +1342,149 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Allocate computation buffers
-  int max_seq_len = has_reference ? ref_tokens->shape[0] : steps + 1;
-  QwenStates qwen_states;
-  malloc_qwen_states(&qwen_states, &config, max_seq_len);
-
   // Set up input tokens
   int* input_tokens;
-  int seq_len;
+  int prompt_len = 0;  // Number of prompt tokens
+  int max_seq_len;
 
   if (has_reference) {
-    // Use reference tokens
+    // Legacy mode with reference data
     input_tokens = ref_tokens->data;
-    seq_len = ref_tokens->shape[0];
+    prompt_len = ref_tokens->shape[0] - 1;  // Exclude the last token for generation
+    max_seq_len = ref_tokens->shape[0];
+  } else if (use_tokenizer) {
+    // New interface: tokenize the prompt
+    TokenizerResult encode_result;
+    if (tokenizer_encode(tokenizer, prompt, &encode_result) != 0) {
+      fprintf(stderr, "Failed to tokenize prompt: \"%s\"\n", prompt);
+      tokenizer_free(tokenizer);
+      return 1;
+    }
+    
+    prompt_len = encode_result.count;
+    max_seq_len = prompt_len + steps;
+    input_tokens = (int*)calloc(max_seq_len, sizeof(int));
+    
+    // Copy prompt tokens
+    memcpy(input_tokens, encode_result.token_ids, prompt_len * sizeof(int));
+    
+    printf("\nTokenized prompt (%d tokens): [", prompt_len);
+    for (int i = 0; i < prompt_len; i++) {
+      printf("%d", encode_result.token_ids[i]);
+      if (i < prompt_len - 1) printf(", ");
+    }
+    printf("]\n");
+    
+    // Show decoded tokens for verification
+    TokenizerResult decode_result;
+    if (tokenizer_decode(tokenizer, encode_result.token_ids, encode_result.count, &decode_result) == 0) {
+      printf("Token breakdown:\n");
+      for (int i = 0; i < decode_result.count; i++) {
+        printf("  [%d] -> \"%s\"\n", encode_result.token_ids[i], decode_result.token_strings[i]);
+      }
+      tokenizer_result_free(&decode_result);
+    }
+    printf("\n");
+    
+    tokenizer_result_free(&encode_result);
   } else {
-    // Simple test tokens (could be made configurable)
-    seq_len = steps + 1;
-    input_tokens = (int*)calloc(seq_len, sizeof(int));
-    //input_tokens[0] = 151643;  // BOS token from config
+    // Legacy mode without reference data
+    prompt_len = 1;  // Just BOS token
+    max_seq_len = steps + 1;
+    input_tokens = (int*)calloc(max_seq_len, sizeof(int));
     input_tokens[0] = 148350;  // BOS token from config
-    for (int i = 1; i < seq_len; i++) {
+    for (int i = 1; i < max_seq_len; i++) {
       input_tokens[i] = 1000 + i;  // Placeholder tokens
     }
   }
 
-  // Run inference
-  gettimeofday(&start_time, NULL);
+  // Allocate computation buffers
+  QwenStates qwen_states;
+  malloc_qwen_states(&qwen_states, &config, max_seq_len);
+
+  // Initialize random seed for sampling
+  srand((unsigned int)time(NULL));
+
+  // Run inference  
+  struct timeval prompt_start, prompt_end, gen_start, gen_end, step_start, step_end;
+  gettimeofday(&prompt_start, NULL);
 
   printf("\nRunning inference...\n");
+  
+  // Process prompt tokens first (if any) to populate K/V cache
+  if (use_tokenizer && prompt_len > 1) {
+    printf("Processing prompt tokens (%d tokens)...\n", prompt_len - 1);
+    for (int i = 0; i < prompt_len - 1; i++) {
+      int* current_token = &input_tokens[i];
+      model_forward(qwen_states.logits, current_token, &weights, &config,
+          &qwen_states, 1, i);
+      if (show_timing) {
+        printf("  Processed token %d: %d\n", i, input_tokens[i]);
+      }
+    }
+    printf("Prompt processing complete. Starting generation...\n\n");
+  }
+  
+  gettimeofday(&prompt_end, NULL);
+  gettimeofday(&gen_start, NULL);
+  
+  // Generate new tokens
+  int generation_start = use_tokenizer ? prompt_len - 1 : 0;
   for (int step = 0; step < steps; step++) {
-    int context_len = step + 1;  // Growing context
+    gettimeofday(&step_start, NULL);
+    int current_pos = generation_start + step;
 
-    // Forward pass: predict next token given context
-    // For efficient K/V caching, only process the new token (last one in context)
-    int* current_token = &input_tokens[step];
+    // Forward pass: predict next token
+    int* current_token = &input_tokens[current_pos];
     model_forward(qwen_states.logits, current_token, &weights, &config,
-        &qwen_states, 1, step);
+        &qwen_states, 1, current_pos);
 
-    // Get predicted token
-    int predicted_token = argmax(qwen_states.logits, config.vocab_size);
-
-    // For autoregressive generation, update input_tokens with our prediction
-    // (Only when not using reference data)
-    if (!has_reference && step + 1 < max_seq_len) {
-      input_tokens[step + 1] = predicted_token;
+    // Select next token (sampling or argmax)
+    int predicted_token;
+    if (use_sampling) {
+      // Create a copy of logits for sampling (to avoid modifying original)
+      float* logits_copy = (float*)malloc(config.vocab_size * sizeof(float));
+      memcpy(logits_copy, qwen_states.logits, config.vocab_size * sizeof(float));
+      predicted_token = sample_topp(logits_copy, config.vocab_size, temperature, top_p);
+      free(logits_copy);
+    } else {
+      predicted_token = argmax(qwen_states.logits, config.vocab_size);
     }
 
-    printf("Step %d: context_len=%d predicted_token=%d",
-        step, context_len, predicted_token);
+    // Store predicted token for next iteration
+    if (current_pos + 1 < max_seq_len) {
+      input_tokens[current_pos + 1] = predicted_token;
+    }
+
+    gettimeofday(&step_end, NULL);
+    double step_time = (step_end.tv_sec - step_start.tv_sec) * 1000.0 +
+                      (step_end.tv_usec - step_start.tv_usec) / 1000.0;
+
+    // Decode and display the generated token
+    if (use_tokenizer) {
+      TokenizerResult decode_result;
+      if (tokenizer_decode(tokenizer, &predicted_token, 1, &decode_result) == 0) {
+        if (show_timing) {
+          printf("Step %d: token=%d -> \"%s\" (%.2f ms)\n", step, predicted_token, 
+                 decode_result.token_strings[0], step_time);
+        } else {
+          printf("Step %d: token=%d -> \"%s\"\n", step, predicted_token, decode_result.token_strings[0]);
+        }
+        tokenizer_result_free(&decode_result);
+      } else {
+        if (show_timing) {
+          printf("Step %d: token=%d (decode failed, %.2f ms)\n", step, predicted_token, step_time);
+        } else {
+          printf("Step %d: token=%d (decode failed)\n", step, predicted_token);
+        }
+      }
+    } else {
+      if (show_timing) {
+        printf("Step %d: predicted_token=%d (%.2f ms)\n", step, predicted_token, step_time);
+      } else {
+        printf("Step %d: predicted_token=%d\n", step, predicted_token);
+      }
+    }
 
     // Compare with reference if available
     if (has_reference && step < ref_tokens->shape[0] - 1) {
@@ -1141,14 +1516,53 @@ int main(int argc, char** argv) {
     printf("\n");
   }
 
+  gettimeofday(&gen_end, NULL);
   gettimeofday(&end_time, NULL);
-  double inference_time = (end_time.tv_sec - start_time.tv_sec) +
+  
+  double total_time = (end_time.tv_sec - start_time.tv_sec) +
     (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
+  double prompt_time = (prompt_end.tv_sec - prompt_start.tv_sec) +
+    (prompt_end.tv_usec - prompt_start.tv_usec) / 1000000.0;
+  double gen_time = (gen_end.tv_sec - gen_start.tv_sec) +
+    (gen_end.tv_usec - gen_start.tv_usec) / 1000000.0;
 
-  printf("\nInference completed in %.2f seconds (%.2f ms/step)\n",
-      inference_time, inference_time * 1000.0 / steps);
+  if (show_timing) {
+    printf("\n=== PERFORMANCE STATISTICS ===\n");
+    if (use_tokenizer && prompt_len > 1) {
+      double prompt_tokens = prompt_len - 1;
+      printf("Prompt processing: %.2f seconds (%.1f tok/s)\n", 
+             prompt_time, prompt_tokens / prompt_time);
+    }
+    printf("Generation: %.2f seconds (%.1f tok/s, %.2f ms/tok)\n", 
+           gen_time, steps / gen_time, gen_time * 1000.0 / steps);
+    printf("Total inference: %.2f seconds\n", total_time);
+  } else {
+    printf("\nInference completed in %.2f seconds (%.2f ms/step)\n",
+           total_time, total_time * 1000.0 / steps);
+  }
+  
+  // Generate final output for tokenizer mode
+  if (use_tokenizer) {
+    int output_len = prompt_len + steps;
+    TokenizerResult final_decode;
+    if (tokenizer_decode(tokenizer, input_tokens, output_len, &final_decode) == 0) {
+      printf("\n============================================================\n");
+      printf("COMPLETE GENERATED TEXT:\n");
+      printf("============================================================\n");
+      for (int i = 0; i < final_decode.count; i++) {
+        printf("%s", final_decode.token_strings[i]);
+      }
+      printf("\n");
+      printf("============================================================\n");
+      
+      tokenizer_result_free(&final_decode);
+    }
+  }
 
   // Cleanup
+  if (tokenizer) {
+    tokenizer_free(tokenizer);
+  }
   if (!has_reference) {
     free(input_tokens);
   }
