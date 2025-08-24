@@ -51,7 +51,7 @@ static void print_usage(const char* program_name) {
   printf("Required Arguments:\n");
   printf("  --input PATH      Input .bin file (FP32 tensors)\n");
   printf("  --quant TYPE      Quantization type: q8, q4, or none\n");
-  printf("  --group-size N    Group size for quantization (32, 64, 128, etc.)\n");
+  printf("  --group-size N    Group size for quantization (must be power of 2: 1, 2, 4, 8, 16, 32, 64, 128, etc.)\n");
   printf("  --output PATH     Output .bin file (quantized tensors)\n\n");
   printf("Optional Arguments:\n");
   printf("  --verbose       Enable verbose output\n");
@@ -123,6 +123,11 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
             fprintf(stderr, "Error: Invalid group size '%s'. Must be a positive integer.\n", optarg);
             return -1;
           }
+          // Validate power-of-2 requirement
+          if ((group_size & (group_size - 1)) != 0) {
+            fprintf(stderr, "Error: Group size '%ld' must be a power of 2 (e.g., 1, 2, 4, 8, 16, 32, 64, 128, 256).\n", group_size);
+            return -1;
+          }
           config->group_size = (size_t)group_size;
         }
         break;
@@ -159,7 +164,7 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
       return -1;
     }
     if (config->group_size == 0) {
-      fprintf(stderr, "Error: --group-size is required (must be > 0, e.g., 32, 64, 128)\n");
+      fprintf(stderr, "Error: --group-size is required (must be power of 2, e.g., 32, 64, 128)\n");
       return -1;
     }
   }
@@ -267,22 +272,42 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
     return 0;
   }
   
-  // Write both tensors to output stream
+  // For Q4, also save zero points tensor
+  TensorBin* zero_point_tensor = NULL;
+  if (quant_type == QUANT_Q4 && qt->zero_points) {
+    char zp_name[512];
+    snprintf(zp_name, sizeof(zp_name), "%s.zero_point", tensor_name);
+    int zp_shape[1] = {qt->num_groups};
+    zero_point_tensor = tensor_create_with_group_size(zp_name, 2, 1, zp_shape, qt->zero_points, group_size);
+    if (!zero_point_tensor) {
+      fprintf(stderr, "Error: Failed to create zero_point tensor for %s\n", tensor_name);
+      tensor_free_single(scale_tensor);
+      tensor_free_single(quant_tensor);
+      quantized_tensor_free(qt);
+      return 0;
+    }
+  }
+  
+  // Write tensors to output stream
   int written_count = 0;
   if (bin_stream_writer_write_tensor(writer, scale_tensor) == 0) written_count++;
   if (bin_stream_writer_write_tensor(writer, quant_tensor) == 0) written_count++;
+  if (zero_point_tensor && bin_stream_writer_write_tensor(writer, zero_point_tensor) == 0) written_count++;
   
   // Cleanup
   tensor_free_single(scale_tensor);
   tensor_free_single(quant_tensor);
+  if (zero_point_tensor) tensor_free_single(zero_point_tensor);
   quantized_tensor_free(qt);
   
-  if (written_count != 2) {
-    fprintf(stderr, "Error: Failed to write quantized tensors for %s\n", tensor_name);
+  int expected_tensors = (quant_type == QUANT_Q4) ? 3 : 2;  // Q4 saves 3 tensors, Q8 saves 2
+  if (written_count != expected_tensors) {
+    fprintf(stderr, "Error: Failed to write quantized tensors for %s (expected %d, wrote %d)\n", 
+            tensor_name, expected_tensors, written_count);
     return 0;
   }
   
-  return 2; // Wrote scale + quantized tensors
+  return expected_tensors; // Wrote scale + quantized (+ zero_point for Q4) tensors
 }
 
 /**

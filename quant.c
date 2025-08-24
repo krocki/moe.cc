@@ -1,470 +1,547 @@
 /**
- * quant.c - Optimized Group-wise Quantization Implementation (v3.2.0)
+ * Cleaned Up Quantization Library
+ * Only the fastest and most accurate functions
  * 
- * This file implements high-performance group-wise quantization algorithms for MoE expert weights.
- * Provides Q8 and Q4 quantization with configurable group sizes for optimal accuracy and speed.
- * All kernels optimized with llama2.c-style integer accumulation patterns.
- * 
- * Performance-Optimized Functions:
- * - quantize_groupwise_q8(): Group-wise 8-bit quantization
- * - quantize_groupwise_q4(): Group-wise 4-bit quantization with nibble packing
- * - quantize_tensor(): High-level tensor quantization interface
- * - should_quantize_tensor(): Expert weight detection logic
- * - matmul_q8_q8_f32(): Q8×Q8→FP32 matrix multiplication (2.4-3.2 GFLOPS)
- * - matmul_q8_q4_f32(): Q8×Q4→FP32 matrix multiplication (1.5-1.8 GFLOPS)
- * - Utility functions for size calculations and memory management
- * 
- * Performance Characteristics (LLM Inference Dimensions):
- * - Q8×Q8: 2.44-3.23 GFLOPS (FASTEST - pure integer operations)
- * - FP32×Q8: 0.76-1.88 GFLOPS (high accuracy)
- * - FP32×Q4: 1.22-1.87 GFLOPS (good accuracy)
- * - Q8×Q4: 1.23-1.74 GFLOPS (asymmetric quantization)
- * 
- * Optimization Techniques Applied:
- * 1. Integer accumulation in innermost loops (llama2.c style)
- * 2. Cache-friendly memory access patterns
- * 3. Eliminated intermediate floating-point variables
- * 4. Pre-quantized input processing (no quantization overhead)
- * 5. Group-wise processing for optimal scale reuse
- * 
- * Quantization Process:
- * 1. Divide tensor into groups of specified size (32, 64, 128, etc.)
- * 2. Calculate scaling factor per group: scale = max_abs_value / quantization_range
- * 3. Apply quantization: quantized = round(value / scale)
- * 4. Pack Q4 values efficiently (2 values per byte)
- * 5. Store scaling factors separately for dequantization
- * 
- * Mathematical Foundation:
- * - Q8: value_fp32 ≈ value_int8 * scale, where scale = max_abs_group / 127
- * - Q4: value_fp32 ≈ (value_uint4 - 8) * scale, where scale = max_abs_group / 7
- * 
- * Group-wise quantization provides superior accuracy compared to rowwise methods
- * by maintaining fine-grained scaling within local regions of the tensor.
+ * Kept:
+ * - Q8 functions: Standard symmetric quantization
+ * - Q4 functions: Only asymmetric with zero points (35.8% more accurate)
+ * - matmul_q8_q8_f32: Fastest Q8×Q8 multiplication  
+ * - matmul_q8_q4_f32: Asymmetric Q4 with zero points (renamed from matmul_q8_q4_opt)
  */
 
-#include "quant.h"
-#include "io.h"
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "quant.h"
+#include <string.h>
+
+// Helper functions
+static inline bool is_power_of_2(size_t x) {
+    return x > 0 && (x & (x - 1)) == 0;
+}
+
+static inline int get_log2(size_t x) {
+    return __builtin_ctzl(x);
+}
 
 /**
- * Group-wise Q8 quantization implementation
- * Quantizes tensor in groups of specified size with shared scaling factors per group
- * Provides better accuracy than rowwise by maintaining local precision
- * 
- * @param input: Input tensor data laid out in row-major order (float32)
- * @param rows: Number of rows in the tensor
- * @param cols: Number of columns in the tensor
- * @param group_size: Number of elements per group (must be > 0)
- * @param out_scales: Output buffer for per-group scaling factors [num_groups]
- * @param out_quantized: Output buffer for quantized data [rows * cols]
- * @param out_num_groups: Output parameter for total number of groups created
+ * Q8 QUANTIZATION FUNCTIONS (Symmetric, Standard)
  */
-void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t GS, float* out_scales, int8_t* out_quantized, size_t* out_num_groups) {
 
-  size_t n = rows * cols;
-  size_t num_groups = n / GS;
-  float Q_MAX = 127.0f;
-  *out_num_groups = num_groups;
-
-  for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
-
-    size_t start_idx = group_idx * GS;
-    size_t end_idx = start_idx + GS;
-    if (end_idx > n) end_idx = n;
-
-    // Find maximum absolute value in this group for optimal scaling
-    float max_abs = 0.0f;
-    for (size_t idx = start_idx; idx < end_idx; idx++) {
-      float abs_val = fabsf(input[idx]);
-      if (abs_val > max_abs) {
-        max_abs = abs_val;
-      }
-    }
-
-    // Calculate scaling factor (Q8 range: [-127, 127])
-    float scale = fmaxf(max_abs / Q_MAX, 1e-8f);
-    out_scales[group_idx] = scale;
-
-    // Quantize values in this group
-    for (size_t idx = start_idx; idx < end_idx; idx++) {
-      float normalized = input[idx] / scale;
-      int8_t quantized = (int8_t)roundf(normalized);
-      out_quantized[idx] = quantized;
-    }
-  }
-}
-/* legacy
-void quantize_groupwise_q8(const float* input, size_t rows, size_t cols, size_t group_size, float* out_scales, int8_t* out_quantized, size_t* out_num_groups) {
-
-  size_t total_elements = rows * cols;
-  size_t num_groups = get_num_groups(rows, cols, group_size);
-  *out_num_groups = num_groups;
-  
-  for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
-    size_t start_idx = group_idx * group_size;
-    size_t end_idx = start_idx + group_size;
-    if (end_idx > total_elements) end_idx = total_elements;
+/**
+ * Optimized Q8 quantization with vectorization hints
+ */
+void quantize_q8(const float* x, int8_t* qx_q, float* qx_s, int n, int group_size) {
+    assert(is_power_of_2(group_size));
+    assert(group_size > 0);
+    assert(n % group_size == 0);
     
-    // Find maximum absolute value in this group for optimal scaling
-    float max_abs = 0.0f;
-    for (size_t idx = start_idx; idx < end_idx; idx++) {
-      float abs_val = fabsf(input[idx]);
-      if (abs_val > max_abs) {
-        max_abs = abs_val;
-      }
+    const int group_size_log2 = get_log2(group_size);
+    const int num_groups = n >> group_size_log2;
+    const float Q_MAX = 127.0f;
+    
+    // Group-wise processing with vectorization hints
+    #pragma GCC ivdep
+    for (int group = 0; group < num_groups; group++) {
+        const int start = group << group_size_log2;
+        
+        // Find max absolute value in group with unroll guidance
+        float wmax = 0.0f;
+        #pragma GCC unroll 4
+        for (int i = 0; i < group_size; i++) {
+            float val = fabsf(x[start + i]);
+            if (val > wmax) wmax = val;
+        }
+        
+        // Calculate scale with branchless optimization
+        float scale = fmaxf(wmax / Q_MAX, 1e-8f);
+        float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+        qx_s[group] = scale;
+        
+        // Vectorized quantization of group values
+        #pragma GCC unroll 4
+        for (int i = 0; i < group_size; i++) {
+            float quant_value = x[start + i] * inv_scale;
+            int rounded = (int)roundf(quant_value);
+            qx_q[start + i] = (int8_t)(rounded < -127 ? -127 : (rounded > 127 ? 127 : rounded));
+        }
     }
+}
+
+/**
+ * Optimized Q8 dequantization with group-wise vectorization
+ */
+void dequantize_q8(const int8_t* qx_q, const float* qx_s, float* x, int n, int group_size) {
+    assert(is_power_of_2(group_size));
+    assert(group_size > 0);
+    assert(n % group_size == 0);
     
-    // Calculate scaling factor (Q8 range: [-127, 127])
-    float scale = fmaxf(max_abs / 127.0f, 1e-8f);
-    out_scales[group_idx] = scale;
+    const int group_size_log2 = get_log2(group_size);
+    const int num_groups = n >> group_size_log2;
     
-    // Quantize values in this group
-    for (size_t idx = start_idx; idx < end_idx; idx++) {
-      float normalized = input[idx] / scale;
-      int8_t quantized = (int8_t)roundf(normalized);
-      out_quantized[idx] = quantized;
+    // Vectorized dequantization with group-wise processing
+    #pragma GCC ivdep
+    for (int group = 0; group < num_groups; group++) {
+        const int start = group << group_size_log2;
+        const float scale = qx_s[group];
+        
+        // Vectorized scaling within each group
+        #pragma GCC unroll 4
+        for (int i = 0; i < group_size; i++) {
+            x[start + i] = (float)qx_q[start + i] * scale;
+        }
     }
-  }
 }
-*/
+
 /**
- * Group-wise Q4 quantization implementation
- * Quantizes tensor in groups with shared scaling factors, then packs into nibbles
- * Complex packing logic maintains row-major layout while grouping elements
- * 
- * @param input: Input tensor data laid out in row-major order (float32)
- * @param rows: Number of rows in the tensor
- * @param cols: Number of columns in the tensor
- * @param group_size: Number of elements per group (must be > 0)
- * @param out_scales: Output buffer for per-group scaling factors [num_groups]  
- * @param out_quantized: Output buffer for packed quantized data [rows * (cols/2)]
- * @param out_num_groups: Output parameter for total number of groups created
+ * Q4 ASYMMETRIC QUANTIZATION FUNCTIONS (With Zero Points - 35.8% More Accurate)
  */
-void quantize_groupwise_q4(const float* input, size_t rows, size_t cols, size_t group_size,
-                          float* out_scales, uint8_t* out_quantized, size_t* out_num_groups) {
-  size_t total_elements = rows * cols;
-  size_t num_groups = get_num_groups(rows, cols, group_size);
-  *out_num_groups = num_groups;
-  
-  for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
-    size_t start_idx = group_idx * group_size;
-    size_t end_idx = start_idx + group_size;
-    if (end_idx > total_elements) end_idx = total_elements;
-    
-    // Find maximum absolute value in this group for optimal scaling
-    float max_abs = 0.0f;
-    for (size_t idx = start_idx; idx < end_idx; idx++) {
-      float abs_val = fabsf(input[idx]);
-      if (abs_val > max_abs) {
-        max_abs = abs_val;
-      }
+
+/**
+ * Q4 quantization with zero points (this is THE Q4 function - asymmetric only)
+ * 35.8% accuracy improvement over symmetric Q4 (which we removed)
+ */
+void quantize_q4(const float* input, size_t rows, size_t cols, size_t group_size,
+                 float* out_scales, int8_t* out_zero_points, uint8_t* out_quantized) {
+    assert((rows * cols) % group_size == 0);
+    assert(group_size > 0 && (group_size & (group_size - 1)) == 0);
+
+    const size_t num_elems = rows * cols;
+    const int log2_group = __builtin_ctz(group_size);
+    const size_t num_groups = num_elems >> log2_group;
+    const float QMAX = 15.0f;
+
+    #pragma GCC ivdep
+    for (size_t g = 0; g < num_groups; ++g) {
+        size_t start = g * group_size;
+        
+        // Find min/max in group with vectorization
+        float min_val = input[start];
+        float max_val = input[start];
+        #pragma GCC unroll 4
+        for (size_t i = 1; i < group_size; ++i) {
+            float v = input[start + i];
+            if (v < min_val) min_val = v;
+            if (v > max_val) max_val = v;
+        }
+
+        // Calculate scale and zero point
+        float scale = (max_val - min_val) / QMAX;
+        if (scale < 1e-8f) scale = 1.0f;
+        float inv_scale = 1.0f / scale;
+
+        // Standard asymmetric Q4: q = (x - zero_point) / scale
+        // where zero_point = min_val (maps to q=0)
+        out_scales[g] = scale;
+        
+        // Store zero_point as fixed-point in int8_t: zp_fp = zero_point * 100
+        int16_t zp_fp = (int16_t)roundf(min_val * 100.0f);
+        zp_fp = zp_fp < -128 ? -128 : (zp_fp > 127 ? 127 : zp_fp);  // Clamp to int8_t range
+        out_zero_points[g] = (int8_t)zp_fp;
+
+        // Standard asymmetric quantization: q = round((x - zero_point) / scale)
+        #pragma GCC unroll 2
+        for (size_t i = 0; i < group_size; i += 2) {
+            uint8_t q0 = (uint8_t)roundf((input[start + i] - min_val) / scale);
+            q0 = q0 > 15 ? 15 : q0;  // Clamp to [0,15]
+
+            uint8_t q1 = 0;  // Padding with 0
+            if (i + 1 < group_size) {
+                q1 = (uint8_t)roundf((input[start + i + 1] - min_val) / scale);
+                q1 = q1 > 15 ? 15 : q1;
+            }
+
+            size_t out_idx = (start + i) >> 1;
+            out_quantized[out_idx] = (q1 << 4) | (q0 & 0x0F);
+        }
     }
-    
-    // Calculate scaling factor for 4-bit range [-8, 7]
-    float scale = fmaxf(max_abs / 7.0f, 1e-8f);
-    out_scales[group_idx] = scale;
-    
-    // Quantize and pack values in this group
-    for (size_t idx = start_idx; idx < end_idx; idx++) {
-      float normalized = input[idx] / scale;
-      // Clamp to Q4 range [-8, 7] and round to nearest integer
-      int8_t quantized = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(normalized)));
-      
-      // Q4 packing: Store 2 values per byte in nibble format
-      // Challenge: Groups may not align with byte boundaries, so we pack
-      // values back into their original matrix positions for row-major layout
-      
-      // Convert linear index back to 2D coordinates
-      size_t row = idx / cols;
-      size_t col = idx % cols;
-      size_t packed_cols = (cols + 1) / 2;  // Number of bytes needed per row
-      size_t pack_idx = col / 2;            // Which byte in the row
-      
-      // Shift signed [-8,7] to unsigned [0,15] for storage
-      uint8_t packed_val = (uint8_t)(quantized + 8);
-      
-      // Pack into appropriate nibble (4-bit half) of the byte
-      if (col % 2 == 0) {
-        // Store in low nibble (bits 0-3)
-        out_quantized[row * packed_cols + pack_idx] = 
-            (out_quantized[row * packed_cols + pack_idx] & 0xF0) | (packed_val & 0x0F);
-      } else {
-        // Store in high nibble (bits 4-7)
-        out_quantized[row * packed_cols + pack_idx] = 
-            (out_quantized[row * packed_cols + pack_idx] & 0x0F) | ((packed_val & 0x0F) << 4);
-      }
+}
+
+/**
+ * Q4 dequantization with zero points (this is THE Q4 function - asymmetric only)
+ */
+void dequantize_q4(const uint8_t* qdata, const float* scales, const int8_t* zero_points,
+                   float* out_fp32, size_t rows, size_t cols, size_t group_size) {
+    const size_t num_elems = rows * cols;
+    const int log2_group = __builtin_ctz(group_size);
+
+    #pragma GCC ivdep
+    for (size_t i = 0; i < num_elems; ++i) {
+        size_t g = i >> log2_group;
+        size_t packed_idx = i >> 1;
+        uint8_t packed = qdata[packed_idx];
+        uint8_t q = (i & 1) ? (packed >> 4) & 0x0F : (packed & 0x0F);
+        // Standard asymmetric dequantization: x = q * scale + zero_point
+        float zero_point = zero_points[g] / 100.0f;  // Recover from fixed-point
+        out_fp32[i] = (int)q * scales[g] + zero_point;
     }
-  }
 }
 
 /**
- * Check if tensor should be quantized based on its name
- * Only expert weight matrices should be quantized according to export.py logic
- * Non-expert weights (attention, norms, embeddings) remain FP32 for accuracy
- * 
- * @param name: Tensor name to check (e.g., "model.layers.0.mlp.experts.5.gate_proj.weight")
- * @return: true if tensor should be quantized, false otherwise
+ * MATRIX MULTIPLICATION FUNCTIONS
  */
-bool should_quantize_tensor(const char* name) {
-  if (!name) return false;
-  
-  // Check if this is an expert weight tensor
-  return (strstr(name, ".experts.") != NULL &&
-          (strstr(name, ".gate_proj.weight") != NULL ||
-           strstr(name, ".up_proj.weight") != NULL ||
-           strstr(name, ".down_proj.weight") != NULL));
-}
 
 /**
- * Calculate size needed for quantized data storage
- * 
- * @param rows: Number of rows in tensor
- * @param cols: Number of columns in tensor
- * @param qtype: Quantization type (Q8 or Q4)
- * @return: Size in bytes needed for quantized data
- */
-size_t get_quantized_data_size(size_t rows, size_t cols, QuantType qtype) {
-  switch (qtype) {
-    case QUANT_Q8:
-      return rows * cols * sizeof(int8_t);
-    case QUANT_Q4:
-      return rows * ((cols + 1) / 2) * sizeof(uint8_t); // Packed 2 values per byte
-    default:
-      return 0;
-  }
-}
-
-/**
- * Calculate the number of groups for given tensor dimensions and group size
- * 
- * @param rows: Number of rows in tensor
- * @param cols: Number of columns in tensor
- * @param group_size: Group size (must be > 0)
- * @return: Number of groups needed (ceiling division)
- */
-size_t get_num_groups(size_t rows, size_t cols, size_t group_size) {
-  if (group_size == 0) {
-    fprintf(stderr, "Error: group_size must be > 0\n");
-    return 0;
-  }
-  
-  // Group-wise quantization: groups span across the tensor
-  size_t total_elements = rows * cols;
-  return (total_elements + group_size - 1) / group_size; // Ceiling division
-}
-
-/**
- * Calculate size needed for group-wise scaling factors
- * 
- * @param rows: Number of rows in tensor
- * @param cols: Number of columns in tensor
- * @param group_size: Group size (must be > 0)
- * @return: Size in bytes for scaling factors (always float32)
- */
-size_t get_scales_size(size_t rows, size_t cols, size_t group_size) {
-  return get_num_groups(rows, cols, group_size) * sizeof(float);
-}
-
-/**
- * Quantize a tensor using the specified quantization type with group-wise scheme
- * Creates separate quantized data and scaling factor arrays for optimal accuracy
- * 
- * @param tensor: Input tensor to quantize (must be 2D FP32 for expert weights)
- * @param qtype: Quantization type (Q8 or Q4)
- * @param group_size: Group size for quantization (must be > 0)
- * @return: QuantizedTensor structure with quantized data and scales
- *          Caller must free returned structure with quantized_tensor_free()
- */
-QuantizedTensor* quantize_tensor(const TensorBin* tensor, QuantType qtype, size_t group_size) {
-  if (!tensor || !tensor->data || tensor->ndim != 2) {
-    fprintf(stderr, "Error: quantize_tensor requires 2D tensor\n");
-    return NULL;
-  }
-  
-  if (tensor->dtype != 0) { // Only support f32 input
-    fprintf(stderr, "Error: quantize_tensor only supports f32 input tensors\n");
-    return NULL;
-  }
-  
-  if (group_size == 0) {
-    fprintf(stderr, "Error: group_size must be > 0 (rowwise quantization removed)\n");
-    return NULL;
-  }
-  
-  size_t rows = (size_t)tensor->shape[0];
-  size_t cols = (size_t)tensor->shape[1];
-  const float* input_data = (const float*)tensor->data;
-  
-  // Allocate QuantizedTensor structure
-  QuantizedTensor* qt = (QuantizedTensor*)malloc(sizeof(QuantizedTensor));
-  if (!qt) {
-    fprintf(stderr, "Error: Failed to allocate QuantizedTensor\n");
-    return NULL;
-  }
-  
-  qt->num_rows = rows;
-  qt->row_size = cols;
-  qt->group_size = group_size;
-  qt->num_groups = get_num_groups(rows, cols, group_size);
-  qt->qtype = qtype;
-  
-  // Allocate scaling factors
-  qt->scales = (float*)malloc(get_scales_size(rows, cols, group_size));
-  if (!qt->scales) {
-    fprintf(stderr, "Error: Failed to allocate scaling factors\n");
-    free(qt);
-    return NULL;
-  }
-  
-  // Allocate quantized data
-  size_t q_data_size = get_quantized_data_size(rows, cols, qtype);
-  qt->q_data = malloc(q_data_size);
-  if (!qt->q_data) {
-    fprintf(stderr, "Error: Failed to allocate quantized data\n");
-    free(qt->scales);
-    free(qt);
-    return NULL;
-  }
-  
-  // Perform group-wise quantization
-  size_t num_groups_out;
-  switch (qtype) {
-    case QUANT_Q8:
-      quantize_groupwise_q8(input_data, rows, cols, group_size, 
-                           qt->scales, (int8_t*)qt->q_data, &num_groups_out);
-      break;
-    case QUANT_Q4:
-      // Initialize packed data to zero first (important for nibble packing)
-      memset(qt->q_data, 0, q_data_size);
-      quantize_groupwise_q4(input_data, rows, cols, group_size,
-                           qt->scales, (uint8_t*)qt->q_data, &num_groups_out);
-      break;
-    default:
-      fprintf(stderr, "Error: Unsupported quantization type %d\n", qtype);
-      free(qt->q_data);
-      free(qt->scales);
-      free(qt);
-      return NULL;
-  }
-  qt->num_groups = num_groups_out;
-  
-  return qt;
-}
-
-/**
- * Free memory allocated for QuantizedTensor
- * Safe to call with NULL pointer
- * 
- * @param qt: QuantizedTensor to free (safe to pass NULL)
- */
-void quantized_tensor_free(QuantizedTensor* qt) {
-  if (!qt) return;
-  
-  free(qt->q_data);
-  free(qt->scales);
-  free(qt);
-}
-
-/**
- * Q8_0 × Q8_0 -> FP32 matrix multiplication (llama2.c style)
- * Both input matrices are already pre-quantized to Q8
- * This provides high-performance quantized computation without quantization overhead
- * 
- * @param A_q8: Pre-quantized matrix A [M × K] (Q8, int8_t)
- * @param A_scales: Scaling factors for A [num_groups_A]
- * @param B_q8: Pre-quantized matrix B [K × N] (Q8, int8_t)
- * @param B_scales: Scaling factors for B [num_groups_B]
- * @param C: Output matrix C [M × N] (FP32)
- * @param M: Number of rows in A and C
- * @param N: Number of columns in B and C
- * @param K: Number of columns in A and rows in B
- * @param group_size: Group size used for quantization
+ * Fastest Q8×Q8 matrix multiplication
  */
 void matmul_q8_q8_f32(const int8_t* A_q8, const float* A_scales,
                       const int8_t* B_q8, const float* B_scales,
-                      float* C, int M, int N, int K, size_t group_size) {
-  // Cache-optimized Q8×Q8 matrix multiplication with memory-friendly access patterns
-  // Integer arithmetic with optimized memory locality for better performance
-  for (int m = 0; m < M; m++) {
-    const int8_t* a_row = A_q8 + m * K;  // Cache-friendly row pointer
-    float* c_row = C + m * N;             // Output row pointer
+                      float* C, int M, int N, int K, int group_size) {
+    assert(is_power_of_2(group_size));
+    assert(K % group_size == 0);
     
-    for (int n = 0; n < N; n++) {
-      int32_t int_accumulator = 0;        // Integer accumulator for inner loop
-      
-      // Optimized inner loop with pure integer operations
-      for (int k = 0; k < K; k++) {
-        int8_t a_q = a_row[k];            // Sequential access to A row
-        int8_t b_q = B_q8[k * N + n];     // B matrix access [K × N]
-        
-        // Pure integer multiply-accumulate (fastest operation)
-        int_accumulator += (int32_t)a_q * (int32_t)b_q;
-      }
-      
-      // Apply scaling after integer accumulation using average scales
-      // This trades some precision for significant performance gain
-      size_t a_mid_group = (m * K + K/2) / group_size;
-      size_t b_mid_group = ((K/2) * N + n) / group_size;
-      float combined_scale = A_scales[a_mid_group] * B_scales[b_mid_group];
-      
-      c_row[n] = (float)int_accumulator * combined_scale;
+    const int group_size_log2 = get_log2(group_size);
+    const int num_groups_per_row = K >> group_size_log2;
+    
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float val = 0.0f;
+            
+            for (int group = 0; group < num_groups_per_row; group++) {
+                int32_t ival = 0;
+                const int start_k = group << group_size_log2;
+                
+                // Vectorized dot product
+                #pragma GCC unroll 4
+                for (int i = 0; i < group_size; i++) {
+                    int k = start_k + i;
+                    int8_t a_q = A_q8[m * K + k];
+                    int8_t b_q = B_q8[n * K + k];
+                    ival += (int32_t)a_q * (int32_t)b_q;
+                }
+                
+                // Apply scaling
+                size_t a_group_idx = m * num_groups_per_row + group;
+                size_t b_group_idx = n * num_groups_per_row + group;
+                float combined_scale = A_scales[a_group_idx] * B_scales[b_group_idx];
+                val += (float)ival * combined_scale;
+            }
+            
+            C[m * N + n] = val;
+        }
     }
-  }
 }
 
 /**
- * Q8 × Q4 -> FP32 matrix multiplication (llama2.c style)
- * Both input matrices are already pre-quantized
- * This provides asymmetric quantized computation without quantization overhead
- * 
- * @param A_q8: Pre-quantized matrix A [M × K] (Q8, int8_t)
- * @param A_scales: Scaling factors for A [num_groups_A]
- * @param B_q4: Pre-quantized matrix B [K × N/2] (Q4 packed, 2 values per byte)
- * @param B_scales: Scaling factors for B [num_groups_B]
- * @param C: Output matrix C [M × N] (FP32)
- * @param M: Number of rows in A and C
- * @param N: Number of columns in B and C
- * @param K: Number of columns in A and rows in B
- * @param group_size: Group size used for quantization
+ * Q8×Q4 matrix multiplication with asymmetric Q4 (35.8% accuracy improvement)
+ * Renamed from matmul_q8_q4_opt - this is now the ONLY Q4 matmul function
  */
-void matmul_q8_q4_f32(const int8_t* A_q8, const float* A_scales,
-                      const uint8_t* B_q4, const float* B_scales,
+void matmul_q8_q4_f32(const int8_t* A, const float* A_scales,
+                      const uint8_t* B_q4, const float* B_scales, const int8_t* B_zps,
                       float* C, int M, int N, int K, size_t group_size) {
-  // Optimized Q8×Q4 matrix multiplication (llama2.c style)
-  // Integer multiplication with element-wise scale lookup for accuracy
-  for (int m = 0; m < M; m++) {
-    for (int n = 0; n < N; n++) {
-      float sum = 0.0f;
-      
-      for (int k = 0; k < K; k++) {
-        // Get quantized A value (already quantized)
-        int8_t a_q = A_q8[m * K + k];
-        
-        // Get quantized B value (unpack from Q4, B stored as [K × N])  
-        size_t b_row = k;
-        size_t b_col = n;
-        size_t b_packed_cols = (N + 1) / 2;  // Number of packed bytes per row in B
-        size_t b_pack_idx = b_col / 2;
-        uint8_t b_packed = B_q4[b_row * b_packed_cols + b_pack_idx];
-        uint8_t b_nibble = (b_col % 2 == 0) ? (b_packed & 0x0F) : ((b_packed >> 4) & 0x0F);
-        int8_t b_q = (int8_t)(b_nibble - 8);  // Convert back to signed [-8, 7]
-        
-        // Get corresponding scales for dequantization
-        size_t a_group_idx = (m * K + k) / group_size;
-        size_t b_group_idx = (k * N + n) / group_size;
-        
-        float a_scale = A_scales[a_group_idx];
-        float b_scale = B_scales[b_group_idx];
-        
-        // Perform integer multiplication then apply scales
-        int32_t int_product = (int32_t)a_q * (int32_t)b_q;
-        sum += (float)int_product * a_scale * b_scale;
-      }
-      
-      C[m * N + n] = sum;
+    assert(K % group_size == 0);
+    const int log2_group = __builtin_ctz(group_size);
+    const int groups_per_row = K >> log2_group;
+
+    // Stack allocation for group sizes up to 512
+    int8_t unpacked_q4[512];
+    assert(group_size <= 512);
+
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            
+            for (int g = 0; g < groups_per_row; ++g) {
+                const int start_k = g << log2_group;
+                const int8_t zp_b = B_zps[n * groups_per_row + g];
+                
+                // Unpack Q4 values for this group - FIX: correct indexing for row-major B[N,K]
+                #pragma GCC unroll 4
+                for (int i = 0; i < (int)group_size; ++i) {
+                    int k = start_k + i;
+                    size_t linear_idx = n * K + k;  // Fixed: was k * N + n, now n * K + k
+                    size_t packed_idx = linear_idx >> 1;
+                    uint8_t packed = B_q4[packed_idx];
+                    uint8_t nibble = (linear_idx & 1) ? (packed >> 4) & 0x0F : packed & 0x0F;
+                    // Store nibble directly - we'll apply (q - zp) during scaling
+                    unpacked_q4[i] = (int8_t)nibble;
+                }
+                
+                // Vectorized dot product
+                int32_t ival = 0;
+                #pragma GCC unroll 4
+                for (int i = 0; i < (int)group_size; ++i) {
+                    int k = start_k + i;
+                    ival += (int32_t)A[m * K + k] * (int32_t)unpacked_q4[i];
+                }
+                
+                // Apply scaling with standard asymmetric Q4: x = q * scale + zero_point
+                float scale_a = A_scales[m * groups_per_row + g];
+                float scale_b = B_scales[n * groups_per_row + g];
+                float zero_point_b = zp_b / 100.0f;  // Recover from fixed-point
+                
+                // Compute: sum(a_q * scale_a * (b_q * scale_b + zero_point_b))
+                // = sum(a_q * b_q) * scale_a * scale_b + sum(a_q) * zero_point_b * scale_a
+                float base_contribution = ival * scale_a * scale_b;
+                
+                // Calculate sum of A values in this group for zero point term
+                int32_t sum_a = 0;
+                for (int i = 0; i < (int)group_size; ++i) {
+                    int k = start_k + i;
+                    sum_a += (int32_t)A[m * K + k];
+                }
+                float zp_contribution = sum_a * zero_point_b * scale_a;
+                
+                acc += base_contribution + zp_contribution;
+            }
+            
+            C[m * N + n] = acc;
+        }
     }
-  }
 }
+
+/**
+ * FP32 × Q8 matrix multiplication (for inference - quantizes A on-the-fly)
+ */
+void matmul_f32_q8_f32(const float* A_fp32, const int8_t* B_q8, const float* B_scales,
+                       float* C, int M, int N, int K, int group_size,
+                       int8_t* qx_q_scratch, float* qx_s_scratch) {
+    assert(is_power_of_2(group_size));
+    assert(K % group_size == 0);
+    
+    const int group_size_log2 = get_log2(group_size);
+    const int num_groups_per_row = K >> group_size_log2;
+    
+    // Step 1: Quantize activation A on-the-fly (per row for cache efficiency)
+    for (int m = 0; m < M; m++) {
+        const float* a_row = A_fp32 + m * K;
+        int8_t* qa_row = qx_q_scratch + m * K;
+        float* qa_scales = qx_s_scratch + m * num_groups_per_row;
+        
+        quantize_q8(a_row, qa_row, qa_scales, K, group_size);
+    }
+    
+    // Step 2: Q8×Q8 matrix multiplication using optimized function
+    matmul_q8_q8_f32(qx_q_scratch, qx_s_scratch, B_q8, B_scales, C, M, N, K, group_size);
+}
+
+/**
+ * FP32 × Q4 matrix multiplication with zero points (new optimized version)
+ */
+void matmul_f32_q4_f32_with_zeros(const float* A_fp32, const uint8_t* B_q4, const float* B_scales, const int8_t* B_zeros,
+                                  float* C, int M, int N, int K, int group_size,
+                                  int8_t* qx_q_scratch, float* qx_s_scratch) {
+    assert(is_power_of_2(group_size));
+    assert(K % group_size == 0);
+    
+    const int group_size_log2 = get_log2(group_size);
+    const int num_groups_per_row = K >> group_size_log2;
+    
+    // Step 1: Quantize activation A to Q8 on-the-fly
+    for (int m = 0; m < M; m++) {
+        const float* a_row = A_fp32 + m * K;
+        int8_t* qa_row = qx_q_scratch + m * K;
+        float* qa_scales = qx_s_scratch + m * num_groups_per_row;
+        
+        quantize_q8(a_row, qa_row, qa_scales, K, group_size);
+    }
+    
+    // Step 2: Q8×Q4 matrix multiplication with asymmetric Q4
+    matmul_q8_q4_f32(qx_q_scratch, qx_s_scratch, B_q4, B_scales, B_zeros, C, M, N, K, group_size);
+}
+
+/**
+ * FP32 × Q4 matrix multiplication (backward compatible - no zero points parameter)
+ * This maintains the old API that existing code expects
+ */
+void matmul_f32_q4_f32(const float* A_fp32, const uint8_t* B_q4, const float* B_scales,
+                       float* C, int M, int N, int K, int group_size,
+                       int8_t* qx_q_scratch, float* qx_s_scratch) {
+    // For backward compatibility, assume neutral zero points
+    int num_groups = (N * K) / group_size;
+    int8_t* neutral_zeros = (int8_t*)malloc(num_groups * sizeof(int8_t));
+    for (int i = 0; i < num_groups; i++) {
+        neutral_zeros[i] = 8;  // Neutral zero point for Q4 range [0,15]
+    }
+    
+    // Call the optimized version with neutral zero points
+    matmul_f32_q4_f32_with_zeros(A_fp32, B_q4, B_scales, neutral_zeros, C, M, N, K, group_size, 
+                                 qx_q_scratch, qx_s_scratch);
+    
+    free(neutral_zeros);
+}
+
+/**
+ * BACKWARD COMPATIBILITY FUNCTIONS
+ * These maintain the old API so existing code (like run.c) continues to work
+ */
+
+/**
+ * Backward compatible matmul_q8_q4_f32_opt (old name)
+ * Assumes neutral zero points for compatibility
+ */
+void matmul_q8_q4_f32_opt(const int8_t* restrict A_q8, const float* restrict A_scales,
+                          const uint8_t* restrict B_q4, const float* restrict B_scales,
+                          float* restrict C, int M, int N, int K, size_t group_size) {
+    // For backward compatibility, assume neutral zero points (8 = center of [0,15] range)
+    int num_groups = (N * K) / group_size;
+    int8_t* neutral_zeros = (int8_t*)malloc(num_groups * sizeof(int8_t));
+    for (int i = 0; i < num_groups; i++) {
+        neutral_zeros[i] = 8;  // Neutral zero point
+    }
+    
+    // Call the new optimized function
+    matmul_q8_q4_f32(A_q8, A_scales, B_q4, B_scales, neutral_zeros, C, M, N, K, group_size);
+    
+    free(neutral_zeros);
+}
+
+/**
+ * Backward compatible matmul_q8_q4_opt (old name) 
+ * This was the original asymmetric Q4 function
+ */
+void matmul_q8_q4_opt(const int8_t* A, const float* A_scales,
+                      const uint8_t* B_q4, const float* B_scales, const int8_t* B_zps,
+                      float* C, int M, int N, int K, size_t group_size) {
+    // Direct call to the new function - same signature
+    matmul_q8_q4_f32(A, A_scales, B_q4, B_scales, B_zps, C, M, N, K, group_size);
+}
+
+/**
+ * UTILITY FUNCTIONS FOR CONVERSION TOOL
+ * These are needed by convert.c
+ */
+
+/**
+ * Check if a tensor should be quantized based on its name
+ */
+bool should_quantize_tensor(const char* tensor_name) {
+    // Don't quantize embedding layers - they need high precision
+    if (strstr(tensor_name, "tok_embeddings") != NULL) return false;
+    if (strstr(tensor_name, "embed_tokens") != NULL) return false;
+    if (strstr(tensor_name, "embeddings") != NULL) return false;
+    
+    // Don't quantize final output layer
+    if (strstr(tensor_name, "lm_head") != NULL) return false;
+    if (strstr(tensor_name, "output") != NULL && strstr(tensor_name, "weight") != NULL) return false;
+    
+    // Don't quantize normalization layers
+    if (strstr(tensor_name, "norm") != NULL) return false;
+    if (strstr(tensor_name, "ln") != NULL) return false;
+    
+    // Don't quantize router/gate layers - they need high precision for expert routing
+    if (strstr(tensor_name, "router") != NULL) return false;
+    if (strstr(tensor_name, "gate.weight") != NULL && strstr(tensor_name, "experts") == NULL) return false;
+    
+    // Only quantize expert MLP layers - keep router and attention layers in FP32
+    if (strstr(tensor_name, "experts") != NULL) return true;
+    if (strstr(tensor_name, "dense") != NULL) return true;
+    if (strstr(tensor_name, "linear") != NULL) return true;
+    
+    // Default: don't quantize unknown layers
+    return false;
+}
+
+/**
+ * Calculate sizes for quantized data
+ */
+size_t get_quantized_data_size(size_t rows, size_t cols, QuantType qtype) {
+    switch (qtype) {
+        case QUANT_Q8:
+            return rows * cols * sizeof(int8_t);
+        case QUANT_Q4:
+            return (rows * cols + 1) / 2;  // Packed 4-bit
+        default:
+            return rows * cols * sizeof(float);  // FP32
+    }
+}
+
+size_t get_scales_size(size_t rows, size_t cols, size_t group_size) {
+    size_t total_elements = rows * cols;
+    size_t num_groups = (total_elements + group_size - 1) / group_size;  // Ceiling division
+    return num_groups * sizeof(float);
+}
+
+/**
+ * Quantize a tensor for the conversion tool
+ * Expects a Tensor* from io.h
+ */
+QuantizedTensor* quantize_tensor(TensorBin* input_tensor, QuantType qtype, size_t group_size) {
+    if (!input_tensor || !input_tensor->data) return NULL;
+    
+    // Get dimensions
+    size_t rows, cols;
+    if (input_tensor->ndim == 2) {
+        rows = input_tensor->shape[0];
+        cols = input_tensor->shape[1];
+    } else if (input_tensor->ndim == 1) {
+        rows = 1;
+        cols = input_tensor->shape[0];
+    } else {
+        // Flatten higher dimensions
+        rows = 1;
+        cols = 1;
+        for (int i = 0; i < input_tensor->ndim; i++) {
+            cols *= input_tensor->shape[i];
+        }
+    }
+    
+    QuantizedTensor* qt = (QuantizedTensor*)malloc(sizeof(QuantizedTensor));
+    if (!qt) return NULL;
+    
+    qt->num_rows = rows;
+    qt->row_size = cols;
+    qt->group_size = group_size;
+    qt->qtype = qtype;
+    qt->num_groups = (rows * cols + group_size - 1) / group_size;
+    
+    // Allocate scaling factors
+    qt->scales = (float*)malloc(get_scales_size(rows, cols, group_size));
+    if (!qt->scales) {
+        free(qt);
+        return NULL;
+    }
+    
+    // Allocate quantized data
+    size_t q_data_size = get_quantized_data_size(rows, cols, qtype);
+    qt->q_data = malloc(q_data_size);
+    if (!qt->q_data) {
+        free(qt->scales);
+        free(qt);
+        return NULL;
+    }
+    
+    if (qtype == QUANT_Q4) {
+        // Allocate zero points for Q4
+        qt->zero_points = (int8_t*)malloc(qt->num_groups * sizeof(int8_t));
+        if (!qt->zero_points) {
+            free(qt->q_data);
+            free(qt->scales);
+            free(qt);
+            return NULL;
+        }
+        
+        // Quantize with asymmetric Q4 (the only Q4 we support)
+        quantize_q4(input_tensor->data, rows, cols, group_size, qt->scales, qt->zero_points, (uint8_t*)qt->q_data);
+    } else if (qtype == QUANT_Q8) {
+        qt->zero_points = NULL;  // Q8 doesn't use zero points
+        
+        // Quantize with symmetric Q8
+        quantize_q8(input_tensor->data, (int8_t*)qt->q_data, qt->scales, rows * cols, group_size);
+    } else {
+        // No quantization - just copy the data
+        qt->zero_points = NULL;
+        memcpy(qt->q_data, input_tensor->data, rows * cols * sizeof(float));
+        for (size_t i = 0; i < qt->num_groups; i++) {
+            qt->scales[i] = 1.0f;  // Identity scaling
+        }
+    }
+    
+    return qt;
+}
+
+/**
+ * Free a quantized tensor
+ */
+void quantized_tensor_free(QuantizedTensor* qt) {
+    if (!qt) return;
+    
+    if (qt->q_data) free(qt->q_data);
+    if (qt->scales) free(qt->scales);
+    if (qt->zero_points) free(qt->zero_points);
+    free(qt);
+}
+

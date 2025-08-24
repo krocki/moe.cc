@@ -26,6 +26,7 @@ typedef struct {
 typedef struct {
   const int8_t* q;      // quantized weights
   const float* s;       // scales (per row or per group)
+  const int8_t* zp;     // zero points (Q4 only, NULL for Q8)
   int rows, cols;       // dimensions
   int dtype;            // 2=q8, 3=q4 (matches TensorBin dtypes)
   size_t group_size;    // group size for quantization (0 = rowwise)
@@ -236,6 +237,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           TensorBin* s_data = need(bf,k);
           lw->Wg_q[e].q = (const int8_t*)q_data->data;
           lw->Wg_q[e].s = (const float*)s_data->data;
+          lw->Wg_q[e].zp = NULL; // Q8 doesn't use zero points
           lw->Wg_q[e].rows = q_data->shape[0];
           lw->Wg_q[e].cols = q_data->shape[1];
           lw->Wg_q[e].dtype = 2; // q8
@@ -245,8 +247,11 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           TensorBin* q_data = need(bf,k);
           snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.scale",L,e);
           TensorBin* s_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.gate_proj.weight.zero_point",L,e);
+          TensorBin* zp_data = bin_find(bf,k); // zero_point tensor may not exist in old models
           lw->Wg_q[e].q = (const int8_t*)q_data->data;
           lw->Wg_q[e].s = (const float*)s_data->data;
+          lw->Wg_q[e].zp = zp_data ? (const int8_t*)zp_data->data : NULL;
           lw->Wg_q[e].rows = q_data->shape[0];
           lw->Wg_q[e].cols = q_data->shape[1] * 2; // q4 packs 2 values per byte
           lw->Wg_q[e].dtype = 3; // q4
@@ -261,6 +266,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           TensorBin* s_data = need(bf,k);
           lw->Wu_q[e].q = (const int8_t*)q_data->data;
           lw->Wu_q[e].s = (const float*)s_data->data;
+          lw->Wu_q[e].zp = NULL; // Q8 doesn't use zero points
           lw->Wu_q[e].rows = q_data->shape[0];
           lw->Wu_q[e].cols = q_data->shape[1];
           lw->Wu_q[e].dtype = 2;
@@ -270,8 +276,11 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           TensorBin* q_data = need(bf,k);
           snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.scale",L,e);
           TensorBin* s_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.up_proj.weight.zero_point",L,e);
+          TensorBin* zp_data = bin_find(bf,k); // zero_point tensor may not exist in old models
           lw->Wu_q[e].q = (const int8_t*)q_data->data;
           lw->Wu_q[e].s = (const float*)s_data->data;
+          lw->Wu_q[e].zp = zp_data ? (const int8_t*)zp_data->data : NULL;
           lw->Wu_q[e].rows = q_data->shape[0];
           lw->Wu_q[e].cols = q_data->shape[1] * 2;
           lw->Wu_q[e].dtype = 3;
@@ -286,6 +295,7 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           TensorBin* s_data = need(bf,k);
           lw->Wd_q[e].q = (const int8_t*)q_data->data;
           lw->Wd_q[e].s = (const float*)s_data->data;
+          lw->Wd_q[e].zp = NULL; // Q8 doesn't use zero points
           lw->Wd_q[e].rows = q_data->shape[0];
           lw->Wd_q[e].cols = q_data->shape[1];
           lw->Wd_q[e].dtype = 2;
@@ -295,8 +305,11 @@ static void load_all_weights(BinFile* bf, QwenConfig* cfg, QwenWeights* w) {
           TensorBin* q_data = need(bf,k);
           snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.scale",L,e);
           TensorBin* s_data = need(bf,k);
+          snprintf(k,sizeof(k),"model.layers.%d.mlp.experts.%d.down_proj.weight.zero_point",L,e);
+          TensorBin* zp_data = bin_find(bf,k); // zero_point tensor may not exist in old models
           lw->Wd_q[e].q = (const int8_t*)q_data->data;
           lw->Wd_q[e].s = (const float*)s_data->data;
+          lw->Wd_q[e].zp = zp_data ? (const int8_t*)zp_data->data : NULL;
           lw->Wd_q[e].rows = q_data->shape[0];
           lw->Wd_q[e].cols = q_data->shape[1] * 2;
           lw->Wd_q[e].dtype = 3;

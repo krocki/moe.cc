@@ -41,6 +41,7 @@
 #include "kernels.h"
 #include "debug_utils.h"
 #include "tokenizer.h"
+#include "quant.h"
 
 // ----------------------------------------------------------------------------
 // QwenStates: Pre-allocated intermediate computation buffers
@@ -80,16 +81,53 @@ typedef struct {
   // Shape: [vocab_size] = [151936] - only for current token
   float* logits;
 
-  // K/V Cache for efficient autoregressive generation
-  // Caches key and value matrices across all layers and positions
+  // Top-k scratch buffer - avoids malloc in topk function
+  // Shape: [num_experts] = [128] - copy of router logits
+  float* topk_scratch;
+
+  // RoPE precomputed inverse frequencies - computed once at init
+  // Shape: [head_dim/2] = [64] - avoids recomputing in every rope call
+  float* rope_inv_freq;
+
+  // Sampling scratch buffer - for prob-index pairs during sampling
+  // Shape: [vocab_size] - only used during sampling, reused across steps
+  // Contains: ProbIdx pairs for efficient top-p sampling
+  void* sampling_scratch;  // ProbIdx* when cast
+
+  // Logits copy buffer - for sampling to avoid modifying original logits
+  // Shape: [vocab_size] = [151936]
+  float* logits_copy;
+
+  // K/V Cache buffers for attention acceleration
   // Shape: [n_layers, max_seq_len, n_kv * head_dim]
-  float* k_cache;  // Key cache
-  float* v_cache;  // Value cache
-  
-  // Maximum sequence length used for cache allocation
+  float* k_cache;
+  float* v_cache;
+
+  // Cache position tracker - current filled length
+  int cache_pos;
+
+  // Maximum sequence length for buffer allocation
   int max_seq_len;
 
+  // Quantized matrix multiplication scratch buffers
+  // For FP32 activation quantization during inference
+  int8_t* qx_q_scratch;    // Quantized activations [max(d_model, d_ff)]
+  float* qx_s_scratch;     // Activation scales [max(d_model, d_ff)/group_size]
+  
+  // Dedicated token quantization buffer for MoE optimization
+  // Pre-quantize token_x once and reuse for all selected experts
+  int8_t* token_q_buffer;  // Quantized token [d_model]
+  float* token_s_buffer;   // Token scales [d_model/group_size]
+
 } QwenStates;
+
+/**
+ * Probability-index pair for efficient sorting / sampling
+ */
+typedef struct {
+  float prob;
+  int idx;
+} ProbIdx;
 
 // ----------------------------------------------------------------------------
 // Memory allocation and deallocation for QwenStates
@@ -138,14 +176,46 @@ void malloc_qwen_states(QwenStates* s, QwenConfig* cfg, int max_seq_len) {
   // Output logits: [vocab_size] - only current token
   s->logits = (float*)calloc(vocab_size, sizeof(float));
 
-  // K/V Cache: [n_layers, max_seq_len, n_kv * head_dim]
-  int n_layers = cfg->n_layers;         // 48 - number of transformer layers
-  size_t cache_size = n_layers * max_seq_len * total_kv_dim;
-  s->k_cache = (float*)calloc(cache_size, sizeof(float));
-  s->v_cache = (float*)calloc(cache_size, sizeof(float));
-  
-  // Store max_seq_len for cache indexing
+  // Top-k scratch buffer: [num_experts=128]
+  s->topk_scratch = (float*)calloc(cfg->n_experts, sizeof(float));
+
+  // RoPE inverse frequencies: [head_dim/2] - precomputed once
+  int d2 = head_dim / 2;  // 64
+  s->rope_inv_freq = (float*)malloc(d2 * sizeof(float));
+  for (int i = 0; i < d2; i++) {
+    float exponent = -2.0f * (float)i / (float)head_dim;
+    s->rope_inv_freq[i] = powf(cfg->rope_theta, exponent);
+  }
+
+  // Sampling scratch buffer: [vocab_size] ProbIdx pairs
+  s->sampling_scratch = malloc(vocab_size * sizeof(ProbIdx));
+
+  // Logits copy buffer: [vocab_size] - for sampling
+  s->logits_copy = (float*)calloc(vocab_size, sizeof(float));
+
+  // K/V Cache buffers: [n_layers, max_seq_len, n_kv * head_dim]
+  int n_layers = cfg->n_layers;     // 48
+  int kv_cache_size = n_layers * max_seq_len * total_kv_dim;
+  s->k_cache = (float*)calloc(kv_cache_size, sizeof(float));
+  s->v_cache = (float*)calloc(kv_cache_size, sizeof(float));
+  s->cache_pos = 0;  // Start with empty cache
+
+  // Store max_seq_len for buffer sizing
   s->max_seq_len = max_seq_len;
+
+  // Quantized matrix multiplication scratch buffers
+  // Size for largest possible activation vector (max of d_model and d_ff)
+  int max_activation_size = (d_model > d_ff) ? d_model : d_ff;
+  s->qx_q_scratch = (int8_t*)calloc(max_activation_size, sizeof(int8_t));
+  // Use minimum group size (1) for scale buffer sizing to handle all cases
+  int min_group_size = 1;
+  int max_scale_size = (max_activation_size + min_group_size - 1) / min_group_size;
+  s->qx_s_scratch = (float*)calloc(max_scale_size, sizeof(float));
+  
+  // Dedicated token quantization buffers for MoE optimization
+  s->token_q_buffer = (int8_t*)calloc(d_model, sizeof(int8_t));
+  int token_scale_size = (d_model + min_group_size - 1) / min_group_size;
+  s->token_s_buffer = (float*)calloc(token_scale_size, sizeof(float));
 }
 
 /**
@@ -159,8 +229,16 @@ void free_qwen_states(QwenStates* s) {
   free(s->expert_indices);
   free(s->expert_weights);
   free(s->logits);
+  free(s->topk_scratch);
+  free(s->rope_inv_freq);
+  free(s->sampling_scratch);
+  free(s->logits_copy);
   free(s->k_cache);
   free(s->v_cache);
+  free(s->qx_q_scratch);
+  free(s->qx_s_scratch);
+  free(s->token_q_buffer);
+  free(s->token_s_buffer);
 }
 
 // ----------------------------------------------------------------------------
@@ -258,30 +336,24 @@ void silu(float* x, int size) {
 }
 
 /**
- * Softmax function for probability normalization
- * Converts logits to probabilities: p_i = exp(x_i - max) / sum(exp(x_j - max))
- * Uses max subtraction for numerical stability
- *
- * @param x: Input logits, output probabilities [size]
- * @param size: Number of elements (typically vocab_size=151936)
+ * Unified softmax: in-place conversion of logits to probabilities
+ * Handles numerical stability and normalization
  */
-void softmax(float* x, int size) {
-  // Find maximum for numerical stability
-  float max_val = x[0];
-  for (int i = 1; i < size; i++) {
-    if (x[i] > max_val) max_val = x[i];
+void softmax_inplace(float* logits, int n) {
+  float max_logit = logits[0];
+  for (int i = 1; i < n; i++) {
+    if (logits[i] > max_logit) max_logit = logits[i];
   }
 
-  // Compute exp and sum
   float sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    x[i] = expf(x[i] - max_val);
-    sum += x[i];
+  for (int i = 0; i < n; i++) {
+    logits[i] = expf(logits[i] - max_logit);
+    sum += logits[i];
   }
 
-  // Normalize to probabilities
-  for (int i = 0; i < size; i++) {
-    x[i] /= sum;
+  float inv = 1.0f / (sum + 1e-9f);
+  for (int i = 0; i < n; i++) {
+    logits[i] *= inv;
   }
 }
 
@@ -293,42 +365,48 @@ void softmax(float* x, int size) {
  * @param indices: Output expert indices [top_k=8]
  * @param k: Number of experts to select (8)
  * @param n: Total number of experts (128)
+ * @param scratch: Preallocated scratch buffer [n] - avoids malloc
  */
-void topk(float* values, int* indices, int k, int n) {
-  // Simple selection sort for top-k (efficient for small k=8)
+void topk(float* values, int* indices, int k, int n, float* scratch) {
+  // Use preallocated scratch buffer instead of malloc
+  for (int i = 0; i < n; i++) {
+    scratch[i] = values[i];
+  }
+
+  // Initialize output arrays
   for (int i = 0; i < k; i++) {
-    int max_idx = i;
-    for (int j = i + 1; j < n; j++) {
-      if (values[j] > values[max_idx]) {
-        max_idx = j;
+    values[i] = -INFINITY;
+    indices[i] = -1;
+  }
+
+  // Find top-k using insertion sort (matches test_model_trace.c implementation)
+  for (int e = 0; e < n; e++) {
+    float v = scratch[e]; // Read from scratch buffer
+    int pos = -1;
+
+    // Find insertion position
+    for (int i = 0; i < k; i++) {
+      if (v > values[i]) {
+        pos = i;
+        break;
       }
     }
-    // Swap values and track index
-    float temp_val = values[i];
-    values[i] = values[max_idx];
-    values[max_idx] = temp_val;
-    indices[i] = max_idx;
+
+    // Insert if position found
+    if (pos >= 0) {
+      // Shift elements right
+      for (int j = k - 1; j > pos; j--) {
+        values[j] = values[j - 1];
+        indices[j] = indices[j - 1];
+      }
+      // Insert new element
+      values[pos] = v;
+      indices[pos] = e;  // Store original expert index
+    }
   }
 
-  // Softmax normalization over top-k values (like reference)
-  // Find max for numerical stability
-  float maxv = values[0];
-  for (int i = 1; i < k; i++) {
-    if (values[i] > maxv) maxv = values[i];
-  }
-
-  // Compute exp(val - max) and sum
-  float sum = 0.0f;
-  for (int i = 0; i < k; i++) {
-    values[i] = expf(values[i] - maxv);
-    sum += values[i];
-  }
-
-  // Normalize
-  float inv = 1.0f / (sum + 1e-9f);
-  for (int i = 0; i < k; i++) {
-    values[i] *= inv;
-  }
+  // Softmax normalization over top-k values
+  softmax_inplace(values, k);
 }
 
 // ----------------------------------------------------------------------------
@@ -368,7 +446,7 @@ static inline void rope_rotate_pair(float* even, float* odd, float c, float s) {
 }
 
 // Apply RoPE to Q and K tensors with GQA awareness
-void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int head_dim, int pos0, float theta) {
+void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int head_dim, int pos0, float* inv_freq) {
   const int Dq = n_q * head_dim;
   const int Dkv = n_kv * head_dim;
   const int d2 = head_dim / 2;
@@ -376,13 +454,6 @@ void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int he
   if ((head_dim & 1) != 0) {
     fprintf(stderr, "[rope] head_dim must be even, got %d\n", head_dim);
     exit(1);
-  }
-
-  // Precompute inverse frequencies
-  float* inv = (float*)malloc(sizeof(float) * (size_t)d2);
-  for (int i = 0; i < d2; i++) {
-    float exponent = -2.0f * (float)i / (float)head_dim;
-    inv[i] = powf(theta, exponent);
   }
 
   // Apply RoPE to each token
@@ -393,7 +464,7 @@ void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int he
     for (int h = 0; h < n_q; h++) {
       float* qh = &Q[(size_t)t * Dq + (size_t)h * head_dim];
       for (int i = 0; i < d2; i++) {
-        float ang = p * inv[i];
+        float ang = p * inv_freq[i];  // Use precomputed inverse frequencies
         float c = cosf(ang), s = sinf(ang);
         rope_rotate_pair(&qh[i], &qh[i + d2], c, s);
       }
@@ -403,14 +474,12 @@ void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int he
     for (int h = 0; h < n_kv; h++) {
       float* kh = &K[(size_t)t * Dkv + (size_t)h * head_dim];
       for (int i = 0; i < d2; i++) {
-        float ang = p * inv[i];
+        float ang = p * inv_freq[i];  // Use precomputed inverse frequencies
         float c = cosf(ang), s = sinf(ang);
         rope_rotate_pair(&kh[i], &kh[i + d2], c, s);
       }
     }
   }
-
-  free(inv);
 }
 
 // ----------------------------------------------------------------------------
@@ -434,35 +503,31 @@ void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int he
  * @param pos: Current position in sequence (for RoPE and caching)
  */
 void attention(float* out, float* x, QwenLayerWeights* layer_weights,
-    QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int layer_idx) {
+    QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int layer_idx, int use_kv_cache) {
 
-  int d_model = cfg->d_model;      // 2048
-  int n_q = cfg->n_q;              // 32 - query heads
-  int n_kv = cfg->n_kv;            // 4 - key/value heads
-  int head_dim = cfg->head_dim;    // 128
-  int total_q_dim = n_q * head_dim;    // 32 * 128 = 4096
-  int total_kv_dim = n_kv * head_dim;  // 4 * 128 = 512
-  float scale = 1.0f / sqrtf((float)head_dim);
+  int d_model = cfg->d_model;
+  int n_q = cfg->n_q;
+  int n_kv = cfg->n_kv;
+  int head_dim = cfg->head_dim;
+  int total_q_dim = n_q * head_dim;
+  int total_kv_dim = n_kv * head_dim;
+  float attn_scale = 1.0f / sqrtf((float)head_dim);
 
-  // Debug: check input x at start of attention
+  int context_len = use_kv_cache ? s->cache_pos + batch_size : batch_size;
 
-  // K/V Cache optimization: compute cache pointers for this layer  
-  size_t cache_layer_offset = (size_t)layer_idx * s->max_seq_len * total_kv_dim;
-  float* layer_k_cache = s->k_cache + cache_layer_offset;
-  float* layer_v_cache = s->v_cache + cache_layer_offset;
+  // Scratch buffer layout
+  float* Q = s->scratch_attn;
+  float* K_current = Q + (size_t)batch_size * total_q_dim;
+  float* V_current = K_current + (size_t)batch_size * total_kv_dim;
+  float* attn_scores = V_current + (size_t)batch_size * total_kv_dim;
+  float* attn_out = attn_scores + (size_t)batch_size * context_len;
 
-  // Scratch buffer layout: Q [batch, Dq] + K [batch, Dkv] + V [batch, Dkv] + S [batch, context] + Hcat [batch, Dq]
-  float* Q    = s->scratch_attn;                                         // [batch_size, total_q_dim]
-  int context_len = pos + batch_size;  // Total context length including current tokens
-  float* K_temp = Q + (size_t)batch_size * total_q_dim;                 // [batch_size, total_kv_dim] (temp for prefill)
-  float* V_temp = K_temp + (size_t)batch_size * total_kv_dim;           // [batch_size, total_kv_dim] (temp for prefill)
-  float* S    = V_temp + (size_t)batch_size * total_kv_dim;             // [batch_size, context_len]
-  float* Hcat = S + (size_t)batch_size * context_len;                   // [batch_size, total_q_dim]
-
-  // Project input to Q (always needed)
+  // Project input to Q, K, V
   matmul(x, (float*)layer_weights->Wq, Q, batch_size, total_q_dim, d_model);
-  
-  // Add Q bias if present
+  matmul(x, (float*)layer_weights->Wk, K_current, batch_size, total_kv_dim, d_model);
+  matmul(x, (float*)layer_weights->Wv, V_current, batch_size, total_kv_dim, d_model);
+
+  // Add biases if present
   if (layer_weights->bq) {
     for (int t = 0; t < batch_size; t++) {
       for (int i = 0; i < total_q_dim; i++) {
@@ -470,113 +535,26 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
       }
     }
   }
-
-  // Declare K,V pointers for attention computation
-  float* K;
-  float* V;
-
-  // For K, V: only compute new positions, use cache for previous ones
-  if (batch_size == 1) {
-    // Autoregressive mode: compute K,V for current token only
-    float* current_k = K_temp;  // Use temp buffer for current computation
-    float* current_v = V_temp;
-    
-    matmul(x, (float*)layer_weights->Wk, current_k, 1, total_kv_dim, d_model);
-    matmul(x, (float*)layer_weights->Wv, current_v, 1, total_kv_dim, d_model);
-    
-    // Add biases to current K,V if present
-    if (layer_weights->bk) {
+  if (layer_weights->bk) {
+    for (int t = 0; t < batch_size; t++) {
       for (int i = 0; i < total_kv_dim; i++) {
-        current_k[i] += ((float*)layer_weights->bk)[i];
+        K_current[(size_t)t * total_kv_dim + i] += ((float*)layer_weights->bk)[i];
       }
     }
-    if (layer_weights->bv) {
+  }
+  if (layer_weights->bv) {
+    for (int t = 0; t < batch_size; t++) {
       for (int i = 0; i < total_kv_dim; i++) {
-        current_v[i] += ((float*)layer_weights->bv)[i];
+        V_current[(size_t)t * total_kv_dim + i] += ((float*)layer_weights->bv)[i];
       }
     }
-    
-    // Apply K normalization to current K if present
-    if (layer_weights->k_norm) {
-      for (int h = 0; h < n_kv; h++) {
-        float* v = &current_k[(size_t)h * head_dim];
-        float msq = 0.f;
-        for (int d = 0; d < head_dim; d++) {
-          float z = v[d];
-          msq += z * z;
-        }
-        float inv = 1.0f / sqrtf(msq / (float)head_dim + cfg->rms_eps);
-        for (int d = 0; d < head_dim; d++) {
-          v[d] = (v[d] * inv) * ((float*)layer_weights->k_norm)[d];
-        }
-      }
-    }
-    
-    // Store current K,V in cache after processing
-    float* cache_k_pos = layer_k_cache + (size_t)pos * total_kv_dim;
-    float* cache_v_pos = layer_v_cache + (size_t)pos * total_kv_dim;
-    memcpy(cache_k_pos, current_k, total_kv_dim * sizeof(float));
-    memcpy(cache_v_pos, current_v, total_kv_dim * sizeof(float));
-    
-    // Set K,V pointers to use cache directly (eliminating copies!)
-    K = layer_k_cache;  // Points to start of cached K for this layer
-    V = layer_v_cache;  // Points to start of cached V for this layer
-  } else {
-    // Prefill mode: compute K,V for entire batch, populate cache
-    K = K_temp;  // Use temporary buffers
-    V = V_temp;
-    
-    matmul(x, (float*)layer_weights->Wk, K, batch_size, total_kv_dim, d_model);
-    matmul(x, (float*)layer_weights->Wv, V, batch_size, total_kv_dim, d_model);
-    
-    // Add biases if present
-    if (layer_weights->bk) {
-      for (int t = 0; t < batch_size; t++) {
-        for (int i = 0; i < total_kv_dim; i++) {
-          K[(size_t)t * total_kv_dim + i] += ((float*)layer_weights->bk)[i];
-        }
-      }
-    }
-    if (layer_weights->bv) {
-      for (int t = 0; t < batch_size; t++) {
-        for (int i = 0; i < total_kv_dim; i++) {
-          V[(size_t)t * total_kv_dim + i] += ((float*)layer_weights->bv)[i];
-        }
-      }
-    }
-    
-    // Apply K normalization if present
-    if (layer_weights->k_norm) {
-      for (int t = 0; t < batch_size; t++) {
-        float* Kt = &K[(size_t)t * total_kv_dim];
-        for (int h = 0; h < n_kv; h++) {
-          float* v = &Kt[(size_t)h * head_dim];
-          float msq = 0.f;
-          for (int d = 0; d < head_dim; d++) {
-            float z = v[d];
-            msq += z * z;
-          }
-          float inv = 1.0f / sqrtf(msq / (float)head_dim + cfg->rms_eps);
-          for (int d = 0; d < head_dim; d++) {
-            v[d] = (v[d] * inv) * ((float*)layer_weights->k_norm)[d];
-          }
-        }
-      }
-    }
-    
-    // Copy K,V to cache for future use
-    memcpy(layer_k_cache + (size_t)pos * total_kv_dim, K, batch_size * total_kv_dim * sizeof(float));
-    memcpy(layer_v_cache + (size_t)pos * total_kv_dim, V, batch_size * total_kv_dim * sizeof(float));
   }
 
-  // Debug: check Q, K, V after matmuls
-
-  // Q RMSNorm per head (Qwen3 specific) 
+  // Apply Q normalization if present
   if (layer_weights->q_norm) {
     for (int t = 0; t < batch_size; t++) {
-      float* Qt = &Q[(size_t)t * total_q_dim];
       for (int h = 0; h < n_q; h++) {
-        float* v = &Qt[(size_t)h * head_dim];
+        float* v = &Q[(size_t)t * total_q_dim + (size_t)h * head_dim];
         float msq = 0.f;
         for (int d = 0; d < head_dim; d++) {
           float z = v[d];
@@ -590,84 +568,94 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
     }
   }
 
-  // Debug: check Q, K after normalization
-
-  // Apply RoPE to Q and K
-  if (batch_size == 1) {
-    // Autoregressive mode: Apply RoPE to current Q and stored K at current position
-    float* current_k = layer_k_cache + (size_t)pos * total_kv_dim;
-    rope_apply_inplace_gqa(Q, current_k, 1, n_q, n_kv, head_dim, pos, cfg->rope_theta);
-  } else {
-    // Prefill mode: Apply RoPE to full batch
-    rope_apply_inplace_gqa(Q, K, batch_size, n_q, n_kv, head_dim, pos, cfg->rope_theta);
+  // Apply K normalization if present
+  if (layer_weights->k_norm) {
+    for (int t = 0; t < batch_size; t++) {
+      for (int h = 0; h < n_kv; h++) {
+        float* k_head = &K_current[(size_t)t * total_kv_dim + (size_t)h * head_dim];
+        float msq = 0.f;
+        for (int d = 0; d < head_dim; d++) {
+          float z = k_head[d];
+          msq += z * z;
+        }
+        float inv = 1.0f / sqrtf(msq / (float)head_dim + cfg->rms_eps);
+        for (int d = 0; d < head_dim; d++) {
+          k_head[d] = (k_head[d] * inv) * ((float*)layer_weights->k_norm)[d];
+        }
+      }
+    }
   }
 
-  // Grouped Query Attention computation
-  int group_size = n_q / n_kv;  // 32/4 = 8 query heads per KV head
+  // Apply RoPE to Q and K using precomputed inverse frequencies
+  rope_apply_inplace_gqa(Q, K_current, batch_size, n_q, n_kv, head_dim, pos, s->rope_inv_freq);
+
+  // KV Cache logic: manage cached and current keys/values
+  float* K_all = K_current;  // Default: no cache
+  float* V_all = V_current;
+
+  if (use_kv_cache) {
+    // Get cache pointers for this layer
+    size_t layer_cache_offset = (size_t)layer_idx * s->max_seq_len * total_kv_dim;
+    float* layer_k_cache = s->k_cache + layer_cache_offset;
+    float* layer_v_cache = s->v_cache + layer_cache_offset;
+
+    // Copy current K,V into cache at position cache_pos
+    for (int t = 0; t < batch_size; t++) {
+      size_t cache_pos_offset = (size_t)(s->cache_pos + t) * total_kv_dim;
+      size_t current_offset = (size_t)t * total_kv_dim;
+      memcpy(layer_k_cache + cache_pos_offset, K_current + current_offset, total_kv_dim * sizeof(float));
+      memcpy(layer_v_cache + cache_pos_offset, V_current + current_offset, total_kv_dim * sizeof(float));
+    }
+
+    K_all = layer_k_cache;  // Use full cache
+    V_all = layer_v_cache;
+  }
+
+  // Grouped Query Attention with KV cache support
+  int group_size = n_q / n_kv;
 
   for (int h = 0; h < n_q; h++) {
     int kv_head = h / group_size;
 
     for (int tq = 0; tq < batch_size; tq++) {
+      int abs_pos_q = (use_kv_cache ? s->cache_pos : 0) + tq;
       const float* q_vec = &Q[(size_t)tq * total_q_dim + (size_t)h * head_dim];
-      float* S_row = &S[(size_t)tq * context_len];
+      float* scores = &attn_scores[(size_t)tq * context_len];
 
-      // Compute attention scores for all key positions in context
+      // Compute attention scores against all cached + current keys
       for (int tk = 0; tk < context_len; tk++) {
-        const float* k_vec = &K[(size_t)tk * total_kv_dim + (size_t)kv_head * head_dim];
+        const float* k_vec = &K_all[(size_t)tk * total_kv_dim + (size_t)kv_head * head_dim];
         float dot = 0.f;
         for (int d = 0; d < head_dim; d++) {
           dot += q_vec[d] * k_vec[d];
         }
-        S_row[tk] = dot * scale;
+        scores[tk] = dot * attn_scale;
       }
 
-      // Apply causal masking (no looking at future tokens)
-      int current_pos = pos + tq;  // Absolute position of this query token
-      for (int tk = current_pos + 1; tk < context_len; tk++) {
-        S[(size_t)tq * context_len + tk] = -INFINITY;
+      // Causal masking: mask future positions
+      for (int tk = abs_pos_q + 1; tk < context_len; tk++) {
+        scores[tk] = -INFINITY;
       }
 
-      // Softmax over the row
-      float max_val = S_row[0];
-      for (int i = 1; i < context_len; i++) {
-        if (S_row[i] > max_val) max_val = S_row[i];
-      }
-      float sum = 0.f;
-      for (int i = 0; i < context_len; i++) {
-        float e = expf(S_row[i] - max_val);
-        S_row[i] = e;
-        sum += e;
-      }
-      float inv = 1.f / (sum + 1e-9f);
-      for (int i = 0; i < context_len; i++) {
-        S_row[i] *= inv;
-      }
-    }
+      // Softmax normalization
+      softmax_inplace(scores, context_len);
 
-    // Apply attention weights to values
-    for (int tq = 0; tq < batch_size; tq++) {
-      const float* P_row = &S[(size_t)tq * context_len];
-      float* head_out = &Hcat[(size_t)tq * total_q_dim + (size_t)h * head_dim];
+      // Apply attention weights to values
+      float* head_out = &attn_out[(size_t)tq * total_q_dim + (size_t)h * head_dim];
+      memset(head_out, 0, head_dim * sizeof(float));
 
-      // Initialize output for this head
-      for (int d = 0; d < head_dim; d++) head_out[d] = 0.f;
-
-      // Accumulate weighted values over full context
       for (int tk = 0; tk < context_len; tk++) {
-        const float* v_vec = &V[(size_t)tk * total_kv_dim + (size_t)kv_head * head_dim];
-        const float p = P_row[tk];
+        const float* v_vec = &V_all[(size_t)tk * total_kv_dim + (size_t)kv_head * head_dim];
+        float weight = scores[tk];
         for (int d = 0; d < head_dim; d++) {
-          head_out[d] += p * v_vec[d];
+          head_out[d] += weight * v_vec[d];
         }
       }
     }
   }
 
-  // Debug: check Hcat before final matmul
-
-  // Output projection: concatenated heads -> d_model
-  matmul(Hcat, (float*)layer_weights->Wo, out, batch_size, d_model, total_q_dim);
+  // Output projection
+  matmul(attn_out, (float*)layer_weights->Wo, out, batch_size, d_model, total_q_dim);
 
   // Add output bias if present
   if (layer_weights->bo) {
@@ -678,7 +666,6 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
     }
   }
 
-  // Debug: check input x at end of attention
 }
 
 // ----------------------------------------------------------------------------
@@ -729,19 +716,23 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
       }
     }
 
-    // Debug: print router logits for layer 0, token 0
-
     // Select top-k experts and get normalized weights
     int* selected_experts = s->expert_indices + t * top_k;      // [top_k]
     float* expert_weights = s->expert_weights + t * top_k;      // [top_k]
 
-    // Apply top-k selection directly on router_logits, then copy selected weights
-    topk(router_logits, selected_experts, top_k, n_experts);
+    // Apply top-k selection using preallocated scratch buffer
+    // topk modifies router_logits in-place, using s->topk_scratch for copy
+    topk(router_logits, selected_experts, top_k, n_experts, s->topk_scratch);
     for (int k = 0; k < top_k; k++) {
-      expert_weights[k] = router_logits[k];
+      expert_weights[k] = router_logits[k];  // Copy normalized weights
     }
 
-    // Debug: print selected experts and weights for layer 0, token 0
+    // Pre-quantize token if we have quantized experts (optimization: quantize once, reuse for all experts)
+    if (layer_weights->experts_quantized) {
+      // Get group size from first expert (all experts should use same group size)
+      int group_size = (int)layer_weights->Wg_q[selected_experts[0]].group_size;
+      quantize_q8(token_x, s->token_q_buffer, s->token_s_buffer, d_model, group_size);
+    }
 
     // Process each selected expert
     for (int k = 0; k < top_k; k++) {
@@ -756,32 +747,96 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
       float* up_out = expert_workspace + d_ff;             // [d_ff]
       float* expert_out = expert_workspace + 2 * d_ff;     // [d_model]
 
-      // FP32 expert weights
-      const float* Wg = layer_weights->Wg[expert_id];  // [d_ff, d_model]
-      const float* Wu = layer_weights->Wu[expert_id];  // [d_ff, d_model]
-      const float* Wd = layer_weights->Wd[expert_id];  // [d_model, d_ff]
+      if (layer_weights->experts_quantized) {
+        // Use quantized expert weights with pre-quantized token
+        const QuantizedWeight* Wg_q = &layer_weights->Wg_q[expert_id];
+        const QuantizedWeight* Wu_q = &layer_weights->Wu_q[expert_id];
+        const QuantizedWeight* Wd_q = &layer_weights->Wd_q[expert_id];
 
-      // Gate projection: x [d_model] * Wg^T [d_model, d_ff] -> [d_ff]
-      matmul(token_x, Wg, gate_out, 1, d_ff, d_model);
+        // Gate projection: token_q [d_model] * Wg_q^T -> [d_ff]
+        // Use pre-quantized token for efficiency
+        if (Wg_q->dtype == 2) {  // Q8 weights
+          matmul_q8_q8_f32(s->token_q_buffer, s->token_s_buffer,
+                           (const int8_t*)Wg_q->q, Wg_q->s,
+                           gate_out, 1, Wg_q->rows, d_model, (int)Wg_q->group_size);
+        } else if (Wg_q->dtype == 3) {  // Q4 weights
+          if (Wg_q->zp) {
+            // Use proper Q4 function with zero points
+            matmul_q8_q4_f32(s->token_q_buffer, s->token_s_buffer,
+                             (const uint8_t*)Wg_q->q, Wg_q->s, Wg_q->zp,
+                             gate_out, 1, Wg_q->rows, d_model, Wg_q->group_size);
+          } else {
+            // Backward compatibility: use neutral zero points
+            matmul_q8_q4_f32_opt(s->token_q_buffer, s->token_s_buffer,
+                             (const uint8_t*)Wg_q->q, Wg_q->s,
+                             gate_out, 1, Wg_q->rows, d_model, Wg_q->group_size);
+          }
+        }
 
-      // Up projection: x [d_model] * Wu^T [d_model, d_ff] -> [d_ff]
-      matmul(token_x, Wu, up_out, 1, d_ff, d_model);
+        // Up projection: token_q [d_model] * Wu_q^T -> [d_ff]
+        if (Wu_q->dtype == 2) {  // Q8 weights
+          matmul_q8_q8_f32(s->token_q_buffer, s->token_s_buffer,
+                           (const int8_t*)Wu_q->q, Wu_q->s,
+                           up_out, 1, Wu_q->rows, d_model, (int)Wu_q->group_size);
+        } else if (Wu_q->dtype == 3) {  // Q4 weights
+          if (Wu_q->zp) {
+            // Use proper Q4 function with zero points
+            matmul_q8_q4_f32(s->token_q_buffer, s->token_s_buffer,
+                             (const uint8_t*)Wu_q->q, Wu_q->s, Wu_q->zp,
+                             up_out, 1, Wu_q->rows, d_model, Wu_q->group_size);
+          } else {
+            // Backward compatibility: use neutral zero points
+            matmul_q8_q4_f32_opt(s->token_q_buffer, s->token_s_buffer,
+                             (const uint8_t*)Wu_q->q, Wu_q->s,
+                             up_out, 1, Wu_q->rows, d_model, Wu_q->group_size);
+          }
+        }
 
-      // Apply SiLU activation: gate_out = silu(gate_out) * up_out
-      silu(gate_out, d_ff);
-      for (int i = 0; i < d_ff; i++) {
-        gate_out[i] *= up_out[i];
+        // Apply SiLU activation: gate_out = silu(gate_out) * up_out
+        silu(gate_out, d_ff);
+        for (int i = 0; i < d_ff; i++) { gate_out[i] *= up_out[i]; }
+
+        // Down projection: gate_out [d_ff] * Wd_q^T -> [d_model]
+        // Need to quantize gate_out since it's the result of SiLU activation
+        if (Wd_q->dtype == 2) {  // Q8 weights
+          matmul_f32_q8_f32(gate_out, (const int8_t*)Wd_q->q, Wd_q->s,
+                            expert_out, 1, Wd_q->rows, d_ff, (int)Wd_q->group_size,
+                            s->qx_q_scratch, s->qx_s_scratch);
+        } else if (Wd_q->dtype == 3) {  // Q4 weights
+          if (Wd_q->zp) {
+            // Use proper Q4 function with zero points
+            matmul_f32_q4_f32_with_zeros(gate_out, (const uint8_t*)Wd_q->q, Wd_q->s, Wd_q->zp,
+                              expert_out, 1, Wd_q->rows, d_ff, (int)Wd_q->group_size,
+                              s->qx_q_scratch, s->qx_s_scratch);
+          } else {
+            // Backward compatibility: use function without zero points
+            matmul_f32_q4_f32(gate_out, (const uint8_t*)Wd_q->q, Wd_q->s,
+                              expert_out, 1, Wd_q->rows, d_ff, (int)Wd_q->group_size,
+                              s->qx_q_scratch, s->qx_s_scratch);
+          }
+        }
+      } else {
+        // Use FP32 expert weights (original behavior)
+        const float* Wg = layer_weights->Wg[expert_id];  // [d_ff, d_model]
+        const float* Wu = layer_weights->Wu[expert_id];  // [d_ff, d_model]
+        const float* Wd = layer_weights->Wd[expert_id];  // [d_model, d_ff]
+
+        // Gate projection: x [d_model] * Wg^T [d_model, d_ff] -> [d_ff]
+        matmul(token_x, Wg, gate_out, 1, d_ff, d_model);
+
+        // Up projection: x [d_model] * Wu^T [d_model, d_ff] -> [d_ff]
+        matmul(token_x, Wu, up_out, 1, d_ff, d_model);
+
+        // Apply SiLU activation: gate_out = silu(gate_out) * up_out
+        silu(gate_out, d_ff);
+        for (int i = 0; i < d_ff; i++) { gate_out[i] *= up_out[i]; }
+
+        // Down projection: gate_out [d_ff] * Wd^T [d_ff, d_model] -> [d_model]
+        matmul(gate_out, Wd, expert_out, 1, d_model, d_ff);
       }
-
-      // Down projection: gate_out [d_ff] * Wd^T [d_ff, d_model] -> [d_model]
-      matmul(gate_out, Wd, expert_out, 1, d_model, d_ff);
-
-      // Debug: print first expert output for layer 0
 
       // Add weighted expert output to final result
-      for (int i = 0; i < d_model; i++) {
-        token_out[i] += expert_weight * expert_out[i];
-      }
+      for (int i = 0; i < d_model; i++) { token_out[i] += expert_weight * expert_out[i]; }
     }
   }
 }
@@ -803,7 +858,7 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
  * @param pos: Current position (for RoPE)
  */
 void transformer_layer(float* out, float* x, QwenLayerWeights* layer_weights,
-    QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int layer_idx) {
+    QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int layer_idx, int use_kv_cache) {
 
   int d_model = cfg->d_model;  // 2048
 
@@ -819,21 +874,12 @@ void transformer_layer(float* out, float* x, QwenLayerWeights* layer_weights,
   // x_norm = RMSNorm(x) using input_layernorm weights
   rmsnorm(s->x, x, (float*)layer_weights->rms1_w, batch_size, d_model, cfg->rms_eps);
 
-  // Debug: save pre-attention norm
-
   // Multi-head attention with residual connection
-  // attn_out = Attention(x_norm)
-  attention(s->scratch_attn, s->x, layer_weights, cfg, s, batch_size, pos, layer_idx);
-
-  // Debug: check x before residual add
+  attention(s->scratch_attn, s->x, layer_weights, cfg, s, batch_size, pos, layer_idx, use_kv_cache);
 
   // Residual connection: x = x_orig + attn_out
   // Note: x_orig is the input to this layer (embedding for layer 0)
-  for (int i = 0; i < batch_size * d_model; i++) {
-    x[i] = x_orig[i] + s->scratch_attn[i];
-  }
-
-  // Debug: save attention output
+  for (int i = 0; i < batch_size * d_model; i++) { x[i] = x_orig[i] + s->scratch_attn[i]; }
 
   // Store input to MoE block for residual connection (before normalization)
   // Need separate buffer since x gets overwritten by rmsnorm
@@ -842,25 +888,17 @@ void transformer_layer(float* out, float* x, QwenLayerWeights* layer_weights,
   float* x_before_moe = s->scratch_moe + s->max_seq_len * d_model + expert_work_size;  // After expert workspace
   memcpy(x_before_moe, x, batch_size * d_model * sizeof(float));
 
-
   // Pre-MoE RMS normalization
   // x_norm = RMSNorm(x) using post_attention_layernorm weights
   rmsnorm(s->x, x, (float*)layer_weights->rms2_w, batch_size, d_model, cfg->rms_eps);
-
-  // Debug: save pre-MoE norm
 
   // Mixture of Experts with residual connection
   // moe_out = MoE(x_norm)
   moe_layer(s->scratch_moe, s->x, layer_weights, cfg, s, batch_size, layer_idx);
 
-  // Debug: check MoE output before residual
-
   // Final residual connection: out = x_before_moe + moe_out
-  for (int i = 0; i < batch_size * d_model; i++) {
-    out[i] = x_before_moe[i] + s->scratch_moe[i];
-  }
+  for (int i = 0; i < batch_size * d_model; i++) { out[i] = x_before_moe[i] + s->scratch_moe[i]; }
 
-  // Debug: save MoE output and final result
 }
 
 // ----------------------------------------------------------------------------
@@ -880,7 +918,7 @@ void transformer_layer(float* out, float* x, QwenLayerWeights* layer_weights,
  * @param pos: Starting position (for RoPE and caching)
  */
 void model_forward(float* logits, int* tokens, QwenWeights* weights,
-    QwenConfig* cfg, QwenStates* s, int batch_size, int pos) {
+    QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int use_kv_cache) {
 
   int d_model = cfg->d_model;           // 2048
   int n_layers = cfg->n_layers;         // 48
@@ -904,9 +942,8 @@ void model_forward(float* logits, int* tokens, QwenWeights* weights,
 
   for (int layer = 0; layer < n_layers; layer++) {
     transformer_layer(layer_output, layer_input, &weights->layers[layer],
-        cfg, s, batch_size, pos, layer);
+        cfg, s, batch_size, pos, layer, use_kv_cache);
 
-    // Debug: print layer output for comparison
 
     // Swap buffers for next layer (avoids copying)
     float* temp = layer_input;
@@ -967,14 +1004,14 @@ int argmax(float* logits, int vocab_size) {
 int sample_multinomial(float* probabilities, int vocab_size) {
   float r = (float)rand() / RAND_MAX;
   float cumulative_prob = 0.0f;
-  
+
   for (int i = 0; i < vocab_size; i++) {
     cumulative_prob += probabilities[i];
     if (r < cumulative_prob) {
       return i;
     }
   }
-  
+
   return vocab_size - 1; // fallback to last token
 }
 
@@ -987,48 +1024,12 @@ int sample_multinomial(float* probabilities, int vocab_size) {
  */
 void apply_temperature(float* logits, int vocab_size, float temperature) {
   if (temperature == 1.0f) return;
-  
+
   for (int i = 0; i < vocab_size; i++) {
     logits[i] /= temperature;
   }
 }
 
-/**
- * Convert logits to probabilities using softmax for sampling
- *
- * @param logits: Input logits [vocab_size]
- * @param probabilities: Output probabilities [vocab_size]
- * @param vocab_size: Size of vocabulary
- */
-void softmax_sampling(float* logits, float* probabilities, int vocab_size) {
-  // Find max for numerical stability
-  float max_logit = logits[0];
-  for (int i = 1; i < vocab_size; i++) {
-    if (logits[i] > max_logit) {
-      max_logit = logits[i];
-    }
-  }
-  
-  // Compute exp and sum
-  float sum = 0.0f;
-  for (int i = 0; i < vocab_size; i++) {
-    probabilities[i] = expf(logits[i] - max_logit);
-    sum += probabilities[i];
-  }
-  
-  // Normalize
-  for (int i = 0; i < vocab_size; i++) {
-    probabilities[i] /= sum;
-  }
-}
-
-/**
- * Probability-index pair for efficient sorting
- */
-typedef struct {
-  float prob;
-  int idx;
-} ProbIdx;
 
 /**
  * Quicksort comparison function for ProbIdx (descending order)
@@ -1048,43 +1049,28 @@ int compare_prob_desc(const void* a, const void* b) {
  * @param vocab_size: Size of vocabulary
  * @param temperature: Temperature for scaling
  * @param top_p: Cumulative probability threshold
+ * @param prob_idx_scratch: Preallocated buffer for ProbIdx pairs [vocab_size]
  * @return: Sampled token ID
  */
-int sample_topp(float* logits, int vocab_size, float temperature, float top_p) {
+int sample_topp(float* logits, int vocab_size, float temperature, float top_p, ProbIdx* prob_idx_scratch) {
   // Apply temperature scaling
   apply_temperature(logits, vocab_size, temperature);
-  
-  // Convert to probabilities and create prob-index pairs
-  ProbIdx* prob_idx = (ProbIdx*)malloc(vocab_size * sizeof(ProbIdx));
-  
-  // Find max for numerical stability
-  float max_logit = logits[0];
-  for (int i = 1; i < vocab_size; i++) {
-    if (logits[i] > max_logit) {
-      max_logit = logits[i];
-    }
-  }
-  
-  // Compute probabilities
-  float sum = 0.0f;
+
+  // Convert logits to probabilities and create prob-index pairs
+  softmax_inplace(logits, vocab_size);
+  ProbIdx* prob_idx = prob_idx_scratch;
   for (int i = 0; i < vocab_size; i++) {
-    prob_idx[i].prob = expf(logits[i] - max_logit);
+    prob_idx[i].prob = logits[i];
     prob_idx[i].idx = i;
-    sum += prob_idx[i].prob;
   }
-  
-  // Normalize probabilities
-  for (int i = 0; i < vocab_size; i++) {
-    prob_idx[i].prob /= sum;
-  }
-  
+
   // Sort by probability (descending) using quicksort
   qsort(prob_idx, vocab_size, sizeof(ProbIdx), compare_prob_desc);
-  
+
   // Find cutoff point for top-p
   float cumulative_prob = 0.0f;
   int cutoff = vocab_size;
-  
+
   for (int i = 0; i < vocab_size; i++) {
     cumulative_prob += prob_idx[i].prob;
     if (cumulative_prob >= top_p) {
@@ -1092,12 +1078,12 @@ int sample_topp(float* logits, int vocab_size, float temperature, float top_p) {
       break;
     }
   }
-  
+
   // Sample from the top-p subset (already normalized)
   float r = (float)rand() / RAND_MAX * cumulative_prob;
   cumulative_prob = 0.0f;
   int selected_token = prob_idx[cutoff - 1].idx; // fallback
-  
+
   for (int i = 0; i < cutoff; i++) {
     cumulative_prob += prob_idx[i].prob;
     if (r < cumulative_prob) {
@@ -1105,9 +1091,8 @@ int sample_topp(float* logits, int vocab_size, float temperature, float top_p) {
       break;
     }
   }
-  
-  free(prob_idx);
-  
+
+  // No need to free - using preallocated scratch buffer
   return selected_token;
 }
 
@@ -1155,6 +1140,7 @@ void usage(char* argv0) {
   printf("  -S, --sample            Use probabilistic sampling instead of greedy argmax\n");
   printf("  -T, --temperature <T>   Temperature for sampling (default: 1.0)\n");
   printf("  -P, --top-p <P>         Top-p threshold for nucleus sampling (default: 0.9)\n");
+  printf("  -K, --no-kv-cache       Disable KV cache (for debugging/comparison)\n");
   printf("  -N, --no-timing         Disable timing statistics display\n");
   printf("  -h, --help              Show this help message\n");
   printf("\n");
@@ -1189,9 +1175,10 @@ int main(int argc, char** argv) {
   char* outbase = NULL;  // Legacy mode only
   int use_tokenizer = 0;
   int use_sampling = 0;
+  int use_kv_cache = 1;  // KV cache enabled by default
   float temperature = 1.0f;
   float top_p = 0.95f;
-  int show_timing = 1;  // Show timing by default
+  int show_timing = 1;
 
   // Check if this is legacy mode (old interface: ./run model.bin steps [outbase])
   if (argc >= 3 && argv[1][0] != '-') {
@@ -1199,12 +1186,12 @@ int main(int argc, char** argv) {
     model_path = argv[1];
     steps = atoi(argv[2]);
     outbase = (argc >= 4) ? argv[3] : NULL;
-    
+
     if (steps <= 0) {
       fprintf(stderr, "Error: steps must be positive\n");
       return 1;
     }
-    
+
     printf("Running in legacy mode (no tokenizer)\n");
     printf("Loading model: %s\n", model_path);
     printf("Running %d inference steps\n", steps);
@@ -1221,6 +1208,7 @@ int main(int argc, char** argv) {
       {"sample",      no_argument,       0, 'S'},
       {"temperature", required_argument, 0, 'T'},
       {"top-p",       required_argument, 0, 'P'},
+      {"no-kv-cache", no_argument,       0, 'K'},
       {"no-timing",   no_argument,       0, 'N'},
       {"help",        no_argument,       0, 'h'},
       {0, 0, 0, 0}
@@ -1228,8 +1216,8 @@ int main(int argc, char** argv) {
 
     int c;
     int option_index = 0;
-    
-    while ((c = getopt_long(argc, argv, "m:t:p:s:ST:P:Nh", long_options, &option_index)) != -1) {
+
+    while ((c = getopt_long(argc, argv, "m:t:p:s:ST:P:KNh", long_options, &option_index)) != -1) {
       switch (c) {
         case 'm':
           model_path = optarg;
@@ -1252,6 +1240,9 @@ int main(int argc, char** argv) {
         case 'P':
           top_p = atof(optarg);
           break;
+        case 'K':
+          use_kv_cache = 0;
+          break;
         case 'N':
           show_timing = 0;
           break;
@@ -1273,7 +1264,7 @@ int main(int argc, char** argv) {
       usage(argv[0]);
       return 1;
     }
-    
+
     use_tokenizer = 1;
     printf("Loading model: %s\n", model_path);
     printf("Loading tokenizer: %s\n", tokenizer_path);
@@ -1313,15 +1304,15 @@ int main(int argc, char** argv) {
       fprintf(stderr, "Failed to create tokenizer\n");
       return 1;
     }
-    
+
     if (tokenizer_load(tokenizer, tokenizer_path) != 0) {
       fprintf(stderr, "Failed to load tokenizer from: %s\n", tokenizer_path);
       tokenizer_free(tokenizer);
       return 1;
     }
-    
+
     printf("Tokenizer loaded: vocabulary size %d\n", tokenizer_vocab_size(tokenizer));
-    
+
     int bos_id, eos_id, pad_id;
     tokenizer_get_special_tokens(tokenizer, &bos_id, &eos_id, &pad_id);
     printf("Special tokens: BOS=%d, EOS=%d, PAD=%d\n", bos_id, eos_id, pad_id);
@@ -1360,21 +1351,21 @@ int main(int argc, char** argv) {
       tokenizer_free(tokenizer);
       return 1;
     }
-    
+
     prompt_len = encode_result.count;
     max_seq_len = prompt_len + steps;
     input_tokens = (int*)calloc(max_seq_len, sizeof(int));
-    
+
     // Copy prompt tokens
     memcpy(input_tokens, encode_result.token_ids, prompt_len * sizeof(int));
-    
+
     printf("\nTokenized prompt (%d tokens): [", prompt_len);
     for (int i = 0; i < prompt_len; i++) {
       printf("%d", encode_result.token_ids[i]);
       if (i < prompt_len - 1) printf(", ");
     }
     printf("]\n");
-    
+
     // Show decoded tokens for verification
     TokenizerResult decode_result;
     if (tokenizer_decode(tokenizer, encode_result.token_ids, encode_result.count, &decode_result) == 0) {
@@ -1385,14 +1376,14 @@ int main(int argc, char** argv) {
       tokenizer_result_free(&decode_result);
     }
     printf("\n");
-    
+
     tokenizer_result_free(&encode_result);
   } else {
     // Legacy mode without reference data
     prompt_len = 1;  // Just BOS token
     max_seq_len = steps + 1;
     input_tokens = (int*)calloc(max_seq_len, sizeof(int));
-    input_tokens[0] = 148350;  // BOS token from config
+    input_tokens[0] = 12522;   // Match test_model_trace.c starting token
     for (int i = 1; i < max_seq_len; i++) {
       input_tokens[i] = 1000 + i;  // Placeholder tokens
     }
@@ -1405,48 +1396,78 @@ int main(int argc, char** argv) {
   // Initialize random seed for sampling
   srand((unsigned int)time(NULL));
 
-  // Run inference  
+  // Run inference
   struct timeval prompt_start, prompt_end, gen_start, gen_end, step_start, step_end;
   gettimeofday(&prompt_start, NULL);
 
   printf("\nRunning inference...\n");
-  
-  // Process prompt tokens first (if any) to populate K/V cache
-  if (use_tokenizer && prompt_len > 1) {
-    printf("Processing prompt tokens (%d tokens)...\n", prompt_len - 1);
-    for (int i = 0; i < prompt_len - 1; i++) {
-      int* current_token = &input_tokens[i];
-      model_forward(qwen_states.logits, current_token, &weights, &config,
-          &qwen_states, 1, i);
-      if (show_timing) {
-        printf("  Processed token %d: %d\n", i, input_tokens[i]);
-      }
-    }
-    printf("Prompt processing complete. Starting generation...\n\n");
-  }
-  
+
+  // No separate prompt processing needed - we process full context in each step
+
   gettimeofday(&prompt_end, NULL);
   gettimeofday(&gen_start, NULL);
-  
+
+  // Process initial prompt for KV cache
+  if (use_kv_cache && prompt_len > 1) {
+    printf("DEBUG: Processing prompt for KV cache (%d tokens)\n", prompt_len);
+    model_forward(qwen_states.logits, input_tokens, &weights, &config,
+        &qwen_states, prompt_len, 0, use_kv_cache);
+    qwen_states.cache_pos = prompt_len;
+  }
+
   // Generate new tokens
   int generation_start = use_tokenizer ? prompt_len - 1 : 0;
+
   for (int step = 0; step < steps; step++) {
     gettimeofday(&step_start, NULL);
     int current_pos = generation_start + step;
 
-    // Forward pass: predict next token
-    int* current_token = &input_tokens[current_pos];
-    model_forward(qwen_states.logits, current_token, &weights, &config,
-        &qwen_states, 1, current_pos);
+    if (use_kv_cache) {
+      // KV cache mode: process only current token (autoregressive)
+      int* current_token = &input_tokens[current_pos];
+      printf("DEBUG: Processing token (KV cache, pos=%d): [%d]\n", current_pos, *current_token);
+
+      model_forward(qwen_states.logits, current_token, &weights, &config,
+          &qwen_states, 1, current_pos, use_kv_cache);
+      qwen_states.cache_pos++;
+    } else {
+      // Non-KV cache mode: process full sequence like test_model_trace.c
+      int sequence_length = current_pos + 1;
+      printf("DEBUG: Processing sequence (T=%d): [", sequence_length);
+      for (int i = 0; i < sequence_length; i++) {
+        printf("%d", input_tokens[i]);
+        if (i < sequence_length - 1) printf(", ");
+      }
+      printf("]\n");
+
+      model_forward(qwen_states.logits, input_tokens, &weights, &config,
+          &qwen_states, sequence_length, 0, use_kv_cache);
+    }
+
+    // Debug: show logits for specific tokens in step 1 (should generate 220)
+    if (step == 1) {
+      printf("DEBUG: Step %d logits[220]=%.6f logits[330]=%.6f logits[279]=%.6f\n",
+             step, qwen_states.logits[220], qwen_states.logits[330], qwen_states.logits[279]);
+
+      // Find actual maximum
+      float max_val = qwen_states.logits[0];
+      int max_idx = 0;
+      for (int i = 1; i < config.vocab_size; i++) {
+        if (qwen_states.logits[i] > max_val) {
+          max_val = qwen_states.logits[i];
+          max_idx = i;
+        }
+      }
+      printf("DEBUG: Actual argmax is token %d with logits=%.6f\n", max_idx, max_val);
+    }
 
     // Select next token (sampling or argmax)
     int predicted_token;
     if (use_sampling) {
-      // Create a copy of logits for sampling (to avoid modifying original)
-      float* logits_copy = (float*)malloc(config.vocab_size * sizeof(float));
-      memcpy(logits_copy, qwen_states.logits, config.vocab_size * sizeof(float));
-      predicted_token = sample_topp(logits_copy, config.vocab_size, temperature, top_p);
-      free(logits_copy);
+      // Use preallocated logits copy buffer for sampling
+      memcpy(qwen_states.logits_copy, qwen_states.logits, config.vocab_size * sizeof(float));
+      predicted_token = sample_topp(qwen_states.logits_copy, config.vocab_size, temperature, top_p,
+                                   (ProbIdx*)qwen_states.sampling_scratch);
     } else {
       predicted_token = argmax(qwen_states.logits, config.vocab_size);
     }
@@ -1465,7 +1486,7 @@ int main(int argc, char** argv) {
       TokenizerResult decode_result;
       if (tokenizer_decode(tokenizer, &predicted_token, 1, &decode_result) == 0) {
         if (show_timing) {
-          printf("Step %d: token=%d -> \"%s\" (%.2f ms)\n", step, predicted_token, 
+          printf("Step %d: token=%d -> \"%s\" (%.2f ms)\n", step, predicted_token,
                  decode_result.token_strings[0], step_time);
         } else {
           printf("Step %d: token=%d -> \"%s\"\n", step, predicted_token, decode_result.token_strings[0]);
@@ -1500,7 +1521,7 @@ int main(int argc, char** argv) {
       logit_error = sqrtf(logit_error / config.vocab_size);  // RMS error
 
       // Compare probabilities
-      softmax(qwen_states.logits, config.vocab_size);  // Convert to probs
+      softmax_inplace(qwen_states.logits, config.vocab_size);
       float* expected_probs = ref_probs->data + step * config.vocab_size;
       float prob_error = 0.0f;
       for (int i = 0; i < config.vocab_size; i++) {
@@ -1518,7 +1539,7 @@ int main(int argc, char** argv) {
 
   gettimeofday(&gen_end, NULL);
   gettimeofday(&end_time, NULL);
-  
+
   double total_time = (end_time.tv_sec - start_time.tv_sec) +
     (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
   double prompt_time = (prompt_end.tv_sec - prompt_start.tv_sec) +
@@ -1530,17 +1551,17 @@ int main(int argc, char** argv) {
     printf("\n=== PERFORMANCE STATISTICS ===\n");
     if (use_tokenizer && prompt_len > 1) {
       double prompt_tokens = prompt_len - 1;
-      printf("Prompt processing: %.2f seconds (%.1f tok/s)\n", 
+      printf("Prompt processing: %.2f seconds (%.1f tok/s)\n",
              prompt_time, prompt_tokens / prompt_time);
     }
-    printf("Generation: %.2f seconds (%.1f tok/s, %.2f ms/tok)\n", 
+    printf("Generation: %.2f seconds (%.1f tok/s, %.2f ms/tok)\n",
            gen_time, steps / gen_time, gen_time * 1000.0 / steps);
     printf("Total inference: %.2f seconds\n", total_time);
   } else {
     printf("\nInference completed in %.2f seconds (%.2f ms/step)\n",
            total_time, total_time * 1000.0 / steps);
   }
-  
+
   // Generate final output for tokenizer mode
   if (use_tokenizer) {
     int output_len = prompt_len + steps;
@@ -1554,7 +1575,7 @@ int main(int argc, char** argv) {
       }
       printf("\n");
       printf("============================================================\n");
-      
+
       tokenizer_result_free(&final_decode);
     }
   }
