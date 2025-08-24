@@ -33,6 +33,7 @@
 #include <inttypes.h>
 
 #include "model.h"
+#include "debug_utils.h"
 #include "io.h"     // bin_load / bin_find / npy_load_* already available
 #include "io_mmap.h"
 #include "utils.h"  // max_abs_diff, etc.
@@ -200,7 +201,7 @@
 #endif
 
 //==============================
-// Debug logging
+
 //==============================
 #ifdef DEBUG
   #define DBG(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
@@ -348,8 +349,14 @@ static void attention_forward_f32(
   const float* qn, const float* kn,
   int n_q, int n_kv, int head_dim, int causal,
   const float rope_theta, const float rms_eps,
-  float* scratch, float* y_out)
+  float* scratch, float* y_out, int layer_idx)
 {
+  // Debug: check input x at start of attention
+  if (layer_idx == 0 && T == 2) {
+    printf("TEST_TRACE: Layer 0, T=2 - Input to attention x[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           x[0], x[1], x[2], x[3], x[4]);
+  }
+  
   PROF_START("attention T=%d dq=%d nkv=%d dh=%d", T, n_q*head_dim, n_kv, head_dim);
   const float scale = 1.0f / sqrtf((float)head_dim);
   const int Dq  = n_q  * head_dim;
@@ -364,6 +371,17 @@ static void attention_forward_f32(
   matmul_f32(x, Wq, Q, T, Dq,  d_model);
   matmul_f32(x, Wk, K, T, Dkv, d_model);
   matmul_f32(x, Wv, V, T, Dkv, d_model);
+
+
+  // Debug: check Q, K, V after matmuls
+  if (layer_idx == 0 && T == 2) {
+    printf("TEST_TRACE: Layer 0, T=2 - Q after matmul[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           Q[0], Q[1], Q[2], Q[3], Q[4]);
+    printf("TEST_TRACE: Layer 0, T=2 - K after matmul[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           K[0], K[1], K[2], K[3], K[4]);
+    printf("TEST_TRACE: Layer 0, T=2 - V after matmul[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           V[0], V[1], V[2], V[3], V[4]);
+  }
 
   if (bq) for (int t=0; t<T; ++t) for (int i=0; i<Dq;  ++i) Q[(size_t)t*Dq  + i] += bq[i];
   if (bk) for (int t=0; t<T; ++t) for (int i=0; i<Dkv; ++i) K[(size_t)t*Dkv + i] += bk[i];
@@ -393,7 +411,25 @@ static void attention_forward_f32(
     }
   }
 
+  // Debug: check Q, K after normalization
+  if (layer_idx == 0 && T == 2) {
+    printf("TEST_TRACE: Layer 0, T=2 - Q after bias+norm[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           Q[0], Q[1], Q[2], Q[3], Q[4]);
+    printf("TEST_TRACE: Layer 0, T=2 - K after bias+norm[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           K[0], K[1], K[2], K[3], K[4]);
+    printf("TEST_TRACE: Layer 0, T=2 - V after bias+norm[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           V[0], V[1], V[2], V[3], V[4]);
+  }
+
   rope_apply_inplace_f32_gqa(Q, K, T, n_q, n_kv, head_dim, /*pos0=*/0, rope_theta);
+
+  // Debug: check Q, K after RoPE
+  if (layer_idx == 0 && T == 2) {
+    printf("TEST_TRACE: Layer 0, T=2 - Q after RoPE[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           Q[0], Q[1], Q[2], Q[3], Q[4]);
+    printf("TEST_TRACE: Layer 0, T=2 - K after RoPE[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           K[0], K[1], K[2], K[3], K[4]);
+  }
 
   const int group = n_q / n_kv;
 
@@ -412,6 +448,12 @@ static void attention_forward_f32(
       float ssum=0.f; for(int i=0;i<T;++i){ float e = expf(Sout[i]-m); Sout[i]=e; ssum+=e; }
       float inv=1.f/(ssum+1e-9f);
       for(int i=0;i<T;++i) Sout[i]*=inv;
+
+      // Debug: show attention scores for first head, first query in T=2
+      if (layer_idx == 0 && T == 2 && h == 0 && tq == 0) {
+        printf("TEST_TRACE: Layer 0, T=2, h=0, tq=0 - Attention scores: %.6f %.6f\n",
+               Sout[0], Sout[1]);
+      }
     }
     for (int tq=0; tq<T; ++tq) {
       const float* Prow = &S[(size_t)tq*T];
@@ -425,8 +467,17 @@ static void attention_forward_f32(
     }
   }
 
+  // Force debug output for Hcat
+
   matmul_f32(Hcat, Wo, y_out, T, d_model, Dq);
   if (bo) for (int t=0; t<T; ++t) for (int i=0; i<d_model; ++i) y_out[(size_t)t*d_model + i] += bo[i];
+  
+  // Debug: check input x at end of attention
+  if (layer_idx == 0 && T == 2) {
+    printf("TEST_TRACE: Layer 0, T=2 - Attention output[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           y_out[0], y_out[1], y_out[2], y_out[3], y_out[4]);
+  }  
+  
   PROF_ENDF();
 }
 
@@ -437,7 +488,8 @@ static void layer_forward_f32(
   int n_q, int n_kv, int head_dim, int causal,
   const float rope_theta, const float rms_eps,
   int n_experts, int top_k, int d_ff,
-  float* scratch_attn, float* scratch_moe, int* tmp_idx, float* tmp_val)
+  float* scratch_attn, float* scratch_moe, int* tmp_idx, float* tmp_val,
+  int layer_idx)
 {
   PROF_START("layer_forward T=%d", T);
 
@@ -448,6 +500,12 @@ static void layer_forward_f32(
   float* x_norm2  = x_after  + (size_t)T*d_model;
 
   rmsnorm_forward_f32(x, lw->rms1_w, T, d_model, rms_eps, x_norm1);
+  
+  // Debug: save pre-attention norm
+  if (layer_idx == 0 && T == 2) {
+    printf("TEST_TRACE: Layer 0, T=2 - Input to attention x_norm1[0:5]: %.6f %.6f %.6f %.6f %.6f\n",
+           x_norm1[0], x_norm1[1], x_norm1[2], x_norm1[3], x_norm1[4]);
+  }
 
   attention_forward_f32(
     x_norm1, T, d_model,
@@ -455,17 +513,33 @@ static void layer_forward_f32(
     lw->q_norm, lw->k_norm,
     n_q, n_kv, head_dim, causal,
     rope_theta, rms_eps,
-    scratch_attn, attn_out
+    scratch_attn, attn_out, layer_idx
   );
 
+  // Debug: check x before residual add
+
   for (int i=0;i<T*d_model;++i) x_after[i] = x[i] + attn_out[i];
+  
+  // Debug: save attention output
+  
   rmsnorm_forward_f32(x_after, lw->rms2_w, T, d_model, rms_eps, x_norm2);
+  
+  // Debug: save pre-MoE norm
 
   // router logits
   float* logits = scratch_moe;                    // [T, E]
   matmul_f32(x_norm2, lw->router_w, logits, T, n_experts, d_model);
   if (lw->router_b) {
     for (int t=0;t<T;++t) for (int e=0;e<n_experts;++e) logits[(size_t)t*n_experts + e] += lw->router_b[e];
+  }
+  
+  // Force debug for router logits at layer 0, time step 1
+  if (layer_idx == 4 && T == 2) {
+    // Print router logits for time step 1 (second token)
+    printf("REF router_logits[t=1][0:7]: %.6f %.6f %.6f %.6f %.6f, %.6f, %.6f, %.6f\n", 
+           logits[n_experts + 0], logits[n_experts + 1], logits[n_experts + 2], 
+           logits[n_experts + 3], logits[n_experts + 4], logits[n_experts + 5],
+           logits[n_experts + 6], logits[n_experts + 7]);
   }
 
   // experts (top-k routing)
@@ -479,6 +553,14 @@ static void layer_forward_f32(
   for (int t=0; t<T; ++t) {
     const float* log_t = &logits[(size_t)t * n_experts];
     topk_desc(log_t, n_experts, top_k, tmp_idx, tmp_val);
+    
+    // Force debug for selected experts at layer 0, time step 1
+    if (layer_idx == 4 && T == 2 && t == 1) {
+      printf("REF selected_experts: %d %d %d %d %d %d %d %d\n", 
+             tmp_idx[0], tmp_idx[1], tmp_idx[2], tmp_idx[3],
+             tmp_idx[4], tmp_idx[5], tmp_idx[6], tmp_idx[7]);
+    }
+    
     // softmax over top-k
     float maxv = tmp_val[0];
     for (int i=1;i<top_k;++i) if (tmp_val[i] > maxv) maxv = tmp_val[i];
@@ -486,6 +568,13 @@ static void layer_forward_f32(
     for (int i=0;i<top_k;++i){ tmp_val[i] = expf(tmp_val[i] - maxv); sum += tmp_val[i]; }
     float inv = 1.0f / (sum + 1e-9f);
     for (int i=0;i<top_k;++i) tmp_val[i] *= inv;
+    
+    // Force debug for expert weights at layer 0, time step 1
+    if (layer_idx == 4 && T == 2 && t == 1) {
+      printf("REF expert_weights[0:8]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+             tmp_val[0], tmp_val[1], tmp_val[2], tmp_val[3],
+             tmp_val[4], tmp_val[5], tmp_val[6], tmp_val[7]);
+    }
 
     for (int i=0;i<top_k;++i){
       int e = tmp_idx[i];
@@ -511,11 +600,27 @@ static void layer_forward_f32(
         matmul_f32(tmp_g, lw->Wd[e], tmp_y, 1, d_model, d_ff);
       }
       
+      // Force debug for first expert output at layer 0, time step 1
+      if (layer_idx == 4 && T == 2 && t == 1 && i == 0) {
+        printf("REF expert_%d_output[0:5]: %.6f %.6f %.6f %.6f %.6f\n", e,
+               tmp_y[0], tmp_y[1], tmp_y[2], tmp_y[3], tmp_y[4]);
+        printf("REF expert_%d_weight: %.6f\n", e, p);
+      }
+      
       for (int q=0;q<d_model;++q) moe_out[(size_t)t*d_model + q] += p * tmp_y[q];
     }
   }
 
+
+
   for (int i=0;i<T*d_model;++i) x[i] = x_after[i] + moe_out[i];
+
+  if (layer_idx < 5 && T <= 2) {
+    printf("REF layer_output after residual layer_idx=%d, T=%d [0:8]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+           layer_idx, T, x[(T-1)*d_model+0], x[(T-1)*d_model+1], x[(T-1)*d_model+2], x[(T-1)*d_model+3],
+           x[(T-1)*d_model+4], x[(T-1)*d_model+5], x[(T-1)*d_model+6], x[(T-1)*d_model+7]);
+  }
+  // Debug: save final MoE output 
 
   free(tmp_g); free(tmp_u); free(tmp_y);
   PROF_ENDF();
@@ -635,6 +740,8 @@ static void model_forward_f32(
     memcpy(&x[(size_t)t*D], &w->tok_emb[(size_t)id*D], sizeof(float)*(size_t)D);
   }
   PROF_ENDF();
+  
+  // Debug: print embedding output for comparison
 
   // stack
   for (int l=0; l<L; ++l) {
@@ -643,8 +750,11 @@ static void model_forward_f32(
       cfg->n_q, cfg->n_kv, cfg->head_dim, cfg->causal,
       cfg->rope_theta, cfg->rms_eps,
       cfg->n_experts, cfg->top_k, cfg->d_ff,
-      s->scratch_attn, s->scratch_moe, s->tmp_idx, s->tmp_val
+      s->scratch_attn, s->scratch_moe, s->tmp_idx, s->tmp_val,
+      l  // Pass layer index
     );
+    
+    // Debug: print layer output for comparison  
   }
 
   // final norm + head (only last row into out_last)
@@ -726,11 +836,14 @@ static int parse_args(int argc, char** argv, Args* a){
   return 0;
 }
 
-//#define MMAP
+#define MMAP
 //==============================
 // Main
 //==============================
 int main(int argc, char** argv) {
+  // Initialize debug system
+  debug_init("debug_activations");
+  
   Args args;
   if (parse_args(argc, argv, &args) != 0) return 1;
 
@@ -810,6 +923,12 @@ int main(int argc, char** argv) {
 
   float* last_logits = (float*)malloc(sizeof(float) * vocab_size);
 
+  // Create autoregressive token sequence (start with prompt, use our own predictions)
+  int max_len = prompt_len + steps;
+  int* autoregressive_tokens = (int*)malloc(max_len * sizeof(int));
+  // Initialize with prompt tokens from reference
+  memcpy(autoregressive_tokens, ref_tokens->data, prompt_len * sizeof(int));
+
   // Run model forward for all steps at once - similar to llama2.c approach
   // where forward() processes the entire sequence and generates multiple tokens
   #ifdef BENCH
@@ -820,15 +939,14 @@ int main(int argc, char** argv) {
 
   // Process each step individually but reuse the same QwenStates
   for (int step = 0; step < steps; ++step) {
-    // Compute the current input length: prompt + previously "generated" tokens (from reference)
+    // Compute the current input length: prompt + previously generated tokens (autoregressive)
     int input_len = prompt_len + step;
 
     DBG("[model_forward_f32] step=%d input_len=%d\n", step, input_len);
 
-    // Run model forward on the prefix tokens[0..input_len-1], get logits for the next token
-    // Now uses pre-allocated QwenStates instead of allocating buffers each time
+    // Run model forward on our own token sequence (autoregressive generation)
     model_forward_f32(
-      ref_tokens->data, input_len,
+      autoregressive_tokens, input_len,
       &config, &weights, qwen_states,
       /*apply_softmax=*/0,
       last_logits
@@ -855,8 +973,13 @@ int main(int argc, char** argv) {
       if (ref_val > max_prob_ref) { max_prob_ref = ref_val; argmax_ref = i; }
     }
 
-    printf("[step %d] logits MAD=%.8g  probs MAD=%.8g  argmax=%d  ref=%d\n",
-           step, max_abs_diff_logits, max_abs_diff_probs, argmax_model, argmax_ref);
+    // Store our predicted token for next autoregressive step
+    if (input_len < max_len) {
+      autoregressive_tokens[input_len] = argmax_model;
+    }
+
+    printf("[step %d] logits MAD=%.8g  probs MAD=%.8g  argmax=%d  ref=%d  auto_token=%d\n",
+           step, max_abs_diff_logits, max_abs_diff_probs, argmax_model, argmax_ref, argmax_model);
   }
 
   #ifdef BENCH
@@ -868,6 +991,7 @@ int main(int argc, char** argv) {
   // Clean up allocated resources
   free_qwen_states(qwen_states);  // Free all intermediate state buffers
   free(last_logits);
+  free(autoregressive_tokens);
   npy_free_i32(ref_tokens);
   npy_free(ref_logits);
   npy_free(ref_probs);
