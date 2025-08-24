@@ -1,10 +1,10 @@
 # Makefile (tab-indented rules)
 CC = gcc
-CFLAGS = -g -O2 -Wall -DDEBUG -DBENCH
+CFLAGS = -g -fsanitize=address -O2 -march=native -mtune=native -Wall
 
-OBJS = io.o utils.o quant.o
+OBJS = io.o utils.o quant.o debug_utils.o
 
-all: list_bin test_model_trace tokenizer_demo tokenizer_test convert test_matmul_harness test_mmap_compare
+all: list_bin test_model_trace tokenizer_demo tokenizer_test convert test_matmul_harness run
 
 # Main targets
 convert: convert.o $(OBJS)
@@ -26,6 +26,12 @@ test_matmul_harness: test_matmul_harness.o $(OBJS) kernels.o
 test_mmap_compare: test_mmap_compare.o io.o io_mmap.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+run: run.o io.o io_mmap.o utils.o kernels.o debug_utils.o tokenizer.o quant.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+debug_compare: debug_compare.o $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 # Test runner targets
 test: test_convert test_convert_integration test_group_quantization convert
 	@echo "Running unit tests..."
@@ -43,7 +49,7 @@ test-integration: test_convert_integration convert
 	@echo "Running integration tests..."
 	./test_convert_integration
 
-test_model_trace: test_model_trace.o io.o io_mmap.o utils.o kernels.o
+test_model_trace: test_model_trace.o io.o io_mmap.o utils.o kernels.o debug_utils.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # Export tokenizer from Qwen3 model
@@ -64,5 +70,5 @@ tokenizer_demo: tokenizer_demo.o tokenizer.o
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace convert test_convert test_convert_integration test_group_quantization test_matmul_harness test_mmap_compare
+	$(RM) -f *.o test_expert test_moe_block tokenizer_test tokenizer_demo test_quantization_consistency test_model_loading test_group_size_edge_cases list_bin test_model_trace convert test_convert test_convert_integration test_group_quantization test_matmul_harness test_mmap_compare run
 	$(RM) -f qwen3_tokenizer.bin qwen3_tokenizer_meta.json
