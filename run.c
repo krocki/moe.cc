@@ -38,8 +38,9 @@
 #include "io.h"
 #include "io_mmap.h"
 #include "utils.h"
-#include "kernels.h"
+// #include "kernels.h"  // Removed - functionality moved to quant.c
 #include "debug_utils.h"
+#include "profiler.h"
 #include "tokenizer.h"
 #include "quant.h"
 
@@ -140,6 +141,27 @@ typedef struct {
  * @param cfg: Model configuration containing dimensions
  * @param max_seq_len: Maximum sequence length (T) - determines buffer sizes
  */
+// Helper function for aligned memory allocation with fallback to regular malloc
+static inline void* aligned_calloc(size_t alignment, size_t count, size_t size) {
+  size_t total_size = count * size;
+  void* ptr = aligned_alloc(alignment, total_size);
+  if (ptr) {
+    memset(ptr, 0, total_size);
+    return ptr;
+  }
+  // Fallback to regular calloc if aligned allocation fails
+  return calloc(count, size);
+}
+
+static inline void* aligned_malloc(size_t alignment, size_t size) {
+  void* ptr = aligned_alloc(alignment, size);
+  if (ptr) {
+    return ptr;
+  }
+  // Fallback to regular malloc if aligned allocation fails
+  return malloc(size);
+}
+
 void malloc_qwen_states(QwenStates* s, QwenConfig* cfg, int max_seq_len) {
   int d_model = cfg->d_model;           // 2048 - main model dimension
   int n_q = cfg->n_q;                   // 32 - number of query heads
@@ -149,25 +171,25 @@ void malloc_qwen_states(QwenStates* s, QwenConfig* cfg, int max_seq_len) {
   int top_k = cfg->top_k;               // 8 - experts per token
   int vocab_size = cfg->vocab_size;     // 151936 - vocabulary size
 
-  // Main activation buffer: [max_seq_len, d_model]
-  s->x = (float*)calloc(max_seq_len * d_model, sizeof(float));
+  // Main activation buffer: [max_seq_len, d_model] - 64-byte aligned for SIMD
+  s->x = (float*)aligned_calloc(64, max_seq_len * d_model, sizeof(float));
 
-  // Final normalization buffer: [max_seq_len, d_model]
-  s->x_final = (float*)calloc(max_seq_len * d_model, sizeof(float));
+  // Final normalization buffer: [max_seq_len, d_model] - 64-byte aligned for SIMD
+  s->x_final = (float*)aligned_calloc(64, max_seq_len * d_model, sizeof(float));
 
   // Attention scratch: Q[T,Dq] + K[T,Dkv] + V[T,Dkv] + S[T,T] + Hcat[T,Dq] + temp buffers
   // For reference: T*Dq + T*Dkv + T*Dkv + T*T + T*Dq + additional temp space
   int total_q_dim = n_q * head_dim;      // 32 * 128 = 4096
   int total_kv_dim = n_kv * head_dim;    // 4 * 128 = 512
   size_t attn_scratch_size = max_seq_len * (2*total_q_dim + 2*total_kv_dim + max_seq_len + 4*d_model) + max_seq_len * d_model;  // +x_orig buffer
-  s->scratch_attn = (float*)calloc(attn_scratch_size, sizeof(float));
+  s->scratch_attn = (float*)aligned_calloc(64, attn_scratch_size, sizeof(float));
 
   // MoE scratch: Need space for expert computations, output buffer, and residual buffers
   // Layout: [max_seq_len * d_model] output + [2 * d_ff + d_model] expert workspace + [max_seq_len * d_model] x_before_moe
   size_t moe_output_size = max_seq_len * d_model;  // Output buffer
   size_t expert_work_size = 2 * d_ff + d_model;  // gate_out + up_out + expert_out
   size_t x_before_moe_size = max_seq_len * d_model;  // Buffer for MoE residual connection
-  s->scratch_moe = (float*)calloc(moe_output_size + expert_work_size + x_before_moe_size, sizeof(float));
+  s->scratch_moe = (float*)aligned_calloc(64, moe_output_size + expert_work_size + x_before_moe_size, sizeof(float));
 
   // Expert selection buffers: [max_seq_len, top_k]
   s->expert_indices = (int*)calloc(max_seq_len * top_k, sizeof(int));
@@ -193,29 +215,33 @@ void malloc_qwen_states(QwenStates* s, QwenConfig* cfg, int max_seq_len) {
   // Logits copy buffer: [vocab_size] - for sampling
   s->logits_copy = (float*)calloc(vocab_size, sizeof(float));
 
-  // K/V Cache buffers: [n_layers, max_seq_len, n_kv * head_dim]
+  // K/V Cache buffers: [n_layers, max_seq_len, n_kv * head_dim] - 64-byte aligned
   int n_layers = cfg->n_layers;     // 48
   int kv_cache_size = n_layers * max_seq_len * total_kv_dim;
-  s->k_cache = (float*)calloc(kv_cache_size, sizeof(float));
-  s->v_cache = (float*)calloc(kv_cache_size, sizeof(float));
+  s->k_cache = (float*)aligned_calloc(64, kv_cache_size, sizeof(float));
+  s->v_cache = (float*)aligned_calloc(64, kv_cache_size, sizeof(float));
   s->cache_pos = 0;  // Start with empty cache
 
   // Store max_seq_len for buffer sizing
   s->max_seq_len = max_seq_len;
 
-  // Quantized matrix multiplication scratch buffers
+  // Quantized matrix multiplication scratch buffers - 64-byte aligned for SIMD
   // Size for largest possible activation vector (max of d_model and d_ff)
   int max_activation_size = (d_model > d_ff) ? d_model : d_ff;
-  s->qx_q_scratch = (int8_t*)calloc(max_activation_size, sizeof(int8_t));
+  s->qx_q_scratch = (int8_t*)aligned_calloc(64, max_activation_size, sizeof(int8_t));
   // Use minimum group size (1) for scale buffer sizing to handle all cases
   int min_group_size = 1;
   int max_scale_size = (max_activation_size + min_group_size - 1) / min_group_size;
-  s->qx_s_scratch = (float*)calloc(max_scale_size, sizeof(float));
+  s->qx_s_scratch = (float*)aligned_calloc(64, max_scale_size, sizeof(float));
   
-  // Dedicated token quantization buffers for MoE optimization
-  s->token_q_buffer = (int8_t*)calloc(d_model, sizeof(int8_t));
-  int token_scale_size = (d_model + min_group_size - 1) / min_group_size;
-  s->token_s_buffer = (float*)calloc(token_scale_size, sizeof(float));
+  // Dedicated token quantization buffers for MoE and attention optimization - 64-byte aligned
+  // Size needs to accommodate max_batch_size * max(d_model, total_q_dim) 
+  // where total_q_dim = n_q * head_dim = 4096 and max_batch_size = max_seq_len (during prefill)
+  int max_single_token_size = (d_model > 4096) ? d_model : 4096; // max(2048, 4096) = 4096
+  int max_token_buffer_size = max_seq_len * max_single_token_size;
+  s->token_q_buffer = (int8_t*)aligned_calloc(64, max_token_buffer_size, sizeof(int8_t));
+  int token_scale_size = (max_token_buffer_size + min_group_size - 1) / min_group_size;
+  s->token_s_buffer = (float*)aligned_calloc(64, token_scale_size, sizeof(float));
 }
 
 /**
@@ -483,6 +509,38 @@ void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int he
 }
 
 // ----------------------------------------------------------------------------
+// Unified Matrix Multiplication Dispatch
+// ----------------------------------------------------------------------------
+
+/**
+ * Unified matmul dispatch - automatically selects Q8×Q8 or Q8×Q4 based on weight type
+ * 
+ * @param A_q8: Quantized input (Q8)
+ * @param A_scales: Input scales
+ * @param B_weight: Quantized weight (can be Q8 or Q4)
+ * @param out: Output buffer
+ * @param M, N, K: Matrix dimensions (MxK × KxN = MxN)
+ * @param group_size: Quantization group size
+ */
+static inline void unified_matmul_dispatch(
+    const int8_t* A_q8, const float* A_scales, 
+    const QuantizedWeight* B_weight, float* out,
+    int M, int N, int K, int group_size) {
+    
+    if (B_weight->zp != NULL) {
+        // Q4 weights: Use Q8×Q4 matmul with zero points
+        matmul_q8_q4_f32(A_q8, A_scales, 
+                        (const uint8_t*)B_weight->q, B_weight->s, B_weight->zp,
+                        out, M, N, K, group_size);
+    } else {
+        // Q8 weights: Use fully optimized Q8×Q8 from optimizations.txt
+        matmul_q8_q8_f32(A_q8, A_scales, 
+                                                (const int8_t*)B_weight->q, B_weight->s,
+                                                out, M, N, K, group_size);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Multi-Head Attention with GQA (Grouped Query Attention)
 // ----------------------------------------------------------------------------
 
@@ -505,6 +563,7 @@ void rope_apply_inplace_gqa(float* Q, float* K, int T, int n_q, int n_kv, int he
 void attention(float* out, float* x, QwenLayerWeights* layer_weights,
     QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int layer_idx, int use_kv_cache) {
 
+  PROF_START("attention");
   int d_model = cfg->d_model;
   int n_q = cfg->n_q;
   int n_kv = cfg->n_kv;
@@ -522,10 +581,31 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
   float* attn_scores = V_current + (size_t)batch_size * total_kv_dim;
   float* attn_out = attn_scores + (size_t)batch_size * context_len;
 
-  // Project input to Q, K, V
-  matmul(x, (float*)layer_weights->Wq, Q, batch_size, total_q_dim, d_model);
-  matmul(x, (float*)layer_weights->Wk, K_current, batch_size, total_kv_dim, d_model);
-  matmul(x, (float*)layer_weights->Wv, V_current, batch_size, total_kv_dim, d_model);
+  // Project input to Q, K, V with unified matmul dispatch
+  if (layer_weights->attention_quantized) {
+    // QUANTIZED ATTENTION: Quantize input once, then use Q8×Q8/Q4 matmuls for Wq, Wk, Wv
+    
+    // Quantize input once for all three projections (shared optimization)
+    int group_size = (int)layer_weights->Wq_q->group_size;
+    quantize_q8(x, s->token_q_buffer, s->token_s_buffer, batch_size * d_model, group_size);
+    
+    // Attention QKV projections using separate matmul calls
+    // Refactored to use individual matmul calls instead of fused kernel
+    {
+      // SEPARATE QKV projections - handles Q8×Q8 and Q8×Q4 automatically
+      unified_matmul_dispatch(s->token_q_buffer, s->token_s_buffer, layer_weights->Wq_q, Q, 
+                             batch_size, total_q_dim, d_model, group_size);
+      unified_matmul_dispatch(s->token_q_buffer, s->token_s_buffer, layer_weights->Wk_q, K_current,
+                             batch_size, total_kv_dim, d_model, group_size);
+      unified_matmul_dispatch(s->token_q_buffer, s->token_s_buffer, layer_weights->Wv_q, V_current,
+                             batch_size, total_kv_dim, d_model, group_size);
+    }
+  } else {
+    // STANDARD FP32 ATTENTION: Use regular FP32 matrix multiplications
+    matmul(x, (float*)layer_weights->Wq, Q, batch_size, total_q_dim, d_model);
+    matmul(x, (float*)layer_weights->Wk, K_current, batch_size, total_kv_dim, d_model);
+    matmul(x, (float*)layer_weights->Wv, V_current, batch_size, total_kv_dim, d_model);
+  }
 
   // Add biases if present
   if (layer_weights->bq) {
@@ -654,8 +734,17 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
     }
   }
 
-  // Output projection
-  matmul(attn_out, (float*)layer_weights->Wo, out, batch_size, d_model, total_q_dim);
+  // Output projection with unified matmul dispatch
+  if (layer_weights->attention_quantized) {
+    // QUANTIZED OUTPUT PROJECTION: Quantize attn_out then use unified dispatch for Wo
+    int group_size = (int)layer_weights->Wo_q->group_size;
+    quantize_q8(attn_out, s->token_q_buffer, s->token_s_buffer, batch_size * total_q_dim, group_size);
+    unified_matmul_dispatch(s->token_q_buffer, s->token_s_buffer, layer_weights->Wo_q, out,
+                           batch_size, d_model, total_q_dim, group_size);
+  } else {
+    // STANDARD FP32 OUTPUT PROJECTION
+    matmul(attn_out, (float*)layer_weights->Wo, out, batch_size, d_model, total_q_dim);
+  }
 
   // Add output bias if present
   if (layer_weights->bo) {
@@ -666,6 +755,7 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
     }
   }
 
+  PROF_END("attention");
 }
 
 // ----------------------------------------------------------------------------
@@ -687,6 +777,7 @@ void attention(float* out, float* x, QwenLayerWeights* layer_weights,
 void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
     QwenConfig* cfg, QwenStates* s, int batch_size, int layer_idx) {
 
+  PROF_START("moe_layer");
   int d_model = cfg->d_model;        // 2048
   int d_ff = cfg->d_ff;              // 768 - expert hidden dimension
   int n_experts = cfg->n_experts;    // 128 - total experts
@@ -730,14 +821,29 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
     // Pre-quantize token if we have quantized experts (optimization: quantize once, reuse for all experts)
     if (layer_weights->experts_quantized) {
       // Get group size from first expert (all experts should use same group size)
-      int group_size = (int)layer_weights->Wg_q[selected_experts[0]].group_size;
-      quantize_q8(token_x, s->token_q_buffer, s->token_s_buffer, d_model, group_size);
+      // Handle case where topk fails to find valid experts (router issue)
+      if (selected_experts[0] < 0 || selected_experts[0] >= n_experts) {
+        fprintf(stderr, "ERROR: Invalid expert index %d (topk failed, router may be corrupted)\n", 
+                selected_experts[0]);
+        // Use default group size as fallback
+        int group_size = 128;  // Default group size
+        quantize_q8(token_x, s->token_q_buffer, s->token_s_buffer, d_model, group_size);
+      } else {
+        int group_size = (int)layer_weights->Wg_q[selected_experts[0]].group_size;
+        quantize_q8(token_x, s->token_q_buffer, s->token_s_buffer, d_model, group_size);
+      }
     }
 
     // Process each selected expert
     for (int k = 0; k < top_k; k++) {
       int expert_id = selected_experts[k];
       float expert_weight = expert_weights[k];
+      
+      // Skip invalid experts (topk failure)
+      if (expert_id < 0 || expert_id >= n_experts) {
+        fprintf(stderr, "WARNING: Skipping invalid expert %d at position %d\n", expert_id, k);
+        continue;
+      }
 
       // Expert computation: 2-layer MLP with SiLU activation
       // gate_proj: [d_model] -> [d_ff], up_proj: [d_model] -> [d_ff]
@@ -753,42 +859,48 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
         const QuantizedWeight* Wu_q = &layer_weights->Wu_q[expert_id];
         const QuantizedWeight* Wd_q = &layer_weights->Wd_q[expert_id];
 
-        // Gate projection: token_q [d_model] * Wg_q^T -> [d_ff]
-        // Use pre-quantized token for efficiency
-        if (Wg_q->dtype == 2) {  // Q8 weights
-          matmul_q8_q8_f32(s->token_q_buffer, s->token_s_buffer,
-                           (const int8_t*)Wg_q->q, Wg_q->s,
-                           gate_out, 1, Wg_q->rows, d_model, (int)Wg_q->group_size);
-        } else if (Wg_q->dtype == 3) {  // Q4 weights
-          if (Wg_q->zp) {
-            // Use proper Q4 function with zero points
-            matmul_q8_q4_f32(s->token_q_buffer, s->token_s_buffer,
-                             (const uint8_t*)Wg_q->q, Wg_q->s, Wg_q->zp,
-                             gate_out, 1, Wg_q->rows, d_model, Wg_q->group_size);
-          } else {
-            // Backward compatibility: use neutral zero points
-            matmul_q8_q4_f32_opt(s->token_q_buffer, s->token_s_buffer,
-                             (const uint8_t*)Wg_q->q, Wg_q->s,
-                             gate_out, 1, Wg_q->rows, d_model, Wg_q->group_size);
+        // MoE Gate+Up projections using separate matmul calls
+        // Refactored to use individual matmul_q8_q4_f32 calls instead of fused kernel
+        {
+          // SEPARATE Gate+Up projections
+          
+          // Gate projection: token_q [d_model] * Wg_q^T -> [d_ff]
+          // Use pre-quantized token for efficiency
+          if (Wg_q->dtype == 2) {  // Q8 weights
+            matmul_q8_q8_f32(s->token_q_buffer, s->token_s_buffer,
+                                                    (const int8_t*)Wg_q->q, Wg_q->s,
+                                                    gate_out, 1, Wg_q->rows, d_model, (int)Wg_q->group_size);
+          } else if (Wg_q->dtype == 3) {  // Q4 weights
+            if (Wg_q->zp) {
+              // Use proper Q4 function with zero points
+              matmul_q8_q4_f32(s->token_q_buffer, s->token_s_buffer,
+                               (const uint8_t*)Wg_q->q, Wg_q->s, Wg_q->zp,
+                               gate_out, 1, Wg_q->rows, d_model, Wg_q->group_size);
+            } else {
+              // Backward compatibility: use neutral zero points
+              //matmul_q8_q4_f32_opt(s->token_q_buffer, s->token_s_buffer,
+              //                 (const uint8_t*)Wg_q->q, Wg_q->s,
+              //                 gate_out, 1, Wg_q->rows, d_model, Wg_q->group_size);
+            }
           }
-        }
 
-        // Up projection: token_q [d_model] * Wu_q^T -> [d_ff]
-        if (Wu_q->dtype == 2) {  // Q8 weights
-          matmul_q8_q8_f32(s->token_q_buffer, s->token_s_buffer,
-                           (const int8_t*)Wu_q->q, Wu_q->s,
-                           up_out, 1, Wu_q->rows, d_model, (int)Wu_q->group_size);
-        } else if (Wu_q->dtype == 3) {  // Q4 weights
-          if (Wu_q->zp) {
-            // Use proper Q4 function with zero points
-            matmul_q8_q4_f32(s->token_q_buffer, s->token_s_buffer,
-                             (const uint8_t*)Wu_q->q, Wu_q->s, Wu_q->zp,
-                             up_out, 1, Wu_q->rows, d_model, Wu_q->group_size);
-          } else {
-            // Backward compatibility: use neutral zero points
-            matmul_q8_q4_f32_opt(s->token_q_buffer, s->token_s_buffer,
-                             (const uint8_t*)Wu_q->q, Wu_q->s,
-                             up_out, 1, Wu_q->rows, d_model, Wu_q->group_size);
+          // Up projection: token_q [d_model] * Wu_q^T -> [d_ff]
+          if (Wu_q->dtype == 2) {  // Q8 weights
+            matmul_q8_q8_f32(s->token_q_buffer, s->token_s_buffer,
+                                                    (const int8_t*)Wu_q->q, Wu_q->s,
+                                                    up_out, 1, Wu_q->rows, d_model, (int)Wu_q->group_size);
+          } else if (Wu_q->dtype == 3) {  // Q4 weights
+            if (Wu_q->zp) {
+              // Use proper Q4 function with zero points
+              matmul_q8_q4_f32(s->token_q_buffer, s->token_s_buffer,
+                               (const uint8_t*)Wu_q->q, Wu_q->s, Wu_q->zp,
+                               up_out, 1, Wu_q->rows, d_model, Wu_q->group_size);
+            } else {
+              //// Backward compatibility: use neutral zero points
+              //matmul_q8_q4_f32_opt(s->token_q_buffer, s->token_s_buffer,
+              //                 (const uint8_t*)Wu_q->q, Wu_q->s,
+              //                 up_out, 1, Wu_q->rows, d_model, Wu_q->group_size);
+            }
           }
         }
 
@@ -800,8 +912,8 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
         // Need to quantize gate_out since it's the result of SiLU activation
         if (Wd_q->dtype == 2) {  // Q8 weights
           matmul_f32_q8_f32(gate_out, (const int8_t*)Wd_q->q, Wd_q->s,
-                            expert_out, 1, Wd_q->rows, d_ff, (int)Wd_q->group_size,
-                            s->qx_q_scratch, s->qx_s_scratch);
+                                                         expert_out, 1, Wd_q->rows, d_ff, (int)Wd_q->group_size,
+                                                         s->qx_q_scratch, s->qx_s_scratch);
         } else if (Wd_q->dtype == 3) {  // Q4 weights
           if (Wd_q->zp) {
             // Use proper Q4 function with zero points
@@ -839,6 +951,7 @@ void moe_layer(float* out, float* x, QwenLayerWeights* layer_weights,
       for (int i = 0; i < d_model; i++) { token_out[i] += expert_weight * expert_out[i]; }
     }
   }
+  PROF_END("moe_layer");
 }
 
 // ----------------------------------------------------------------------------
@@ -920,6 +1033,8 @@ void transformer_layer(float* out, float* x, QwenLayerWeights* layer_weights,
 void model_forward(float* logits, int* tokens, QwenWeights* weights,
     QwenConfig* cfg, QwenStates* s, int batch_size, int pos, int use_kv_cache) {
 
+  PROF_START("model_forward");
+
   int d_model = cfg->d_model;           // 2048
   int n_layers = cfg->n_layers;         // 48
   int vocab_size = cfg->vocab_size;     // 151936
@@ -960,8 +1075,14 @@ void model_forward(float* logits, int* tokens, QwenWeights* weights,
   // Use last token's hidden state for next token prediction
   float* last_hidden = s->x_final + (batch_size - 1) * d_model;  // [d_model]
 
-  if (weights->lm_head) {
-    // Separate output head: lm_head [vocab_size, d_model] = [151936, 2048]
+  if (weights->lm_head_quantized) {
+    // Quantized lm_head: Use F32×Q8 matmul for quantized output layer (always Q8)
+    QuantizedWeight* lm_q = weights->lm_head_q;
+    matmul_f32_q8_f32(last_hidden, (const int8_t*)lm_q->q, lm_q->s,
+                                                   logits, 1, vocab_size, d_model, (int)lm_q->group_size,
+                                                   s->qx_q_scratch, s->qx_s_scratch);
+  } else if (weights->lm_head) {
+    // Separate FP32 output head: lm_head [vocab_size, d_model] = [151936, 2048]
     matmul(last_hidden, weights->lm_head, logits, 1, vocab_size, d_model);
   } else {
     // Tied weights: reuse token embedding matrix (transposed)
@@ -969,6 +1090,8 @@ void model_forward(float* logits, int* tokens, QwenWeights* weights,
     matmul_transposed(logits, last_hidden, (float*)weights->tok_emb,
         1, vocab_size, d_model);
   }
+
+  PROF_END("model_forward");
 }
 
 // ----------------------------------------------------------------------------
@@ -1164,6 +1287,9 @@ void usage(char* argv0) {
 }
 
 int main(int argc, char** argv) {
+  PROF_INIT();
+  PROF_START("main");
+  
   // Initialize debug system
   debug_init("debug_activations");
 
@@ -1273,10 +1399,15 @@ int main(int argc, char** argv) {
   }
 
   // Load model weights - use mmap for efficiency
+  PROF_START("model_loading");
   struct timeval start_time, end_time;
   gettimeofday(&start_time, NULL);
 
+#ifdef USE_MMAP
   BinFile* bin_file = bin_load_mmap(model_path);
+#else
+  BinFile* bin_file = bin_load(model_path);
+#endif
   if (!bin_file) {
     fprintf(stderr, "Failed to load model file: %s\n", model_path);
     return 1;
@@ -1292,6 +1423,7 @@ int main(int argc, char** argv) {
     (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
 
   printf("Model loaded in %.2f seconds\n", load_time);
+  PROF_END("model_loading");
   printf("Model: d_model=%d layers=%d heads=%d/%d vocab=%d experts=%d/%d\n",
       config.d_model, config.n_layers, config.n_q, config.n_kv,
       config.vocab_size, config.n_experts, config.top_k);
@@ -1400,23 +1532,35 @@ int main(int argc, char** argv) {
   struct timeval prompt_start, prompt_end, gen_start, gen_end, step_start, step_end;
   gettimeofday(&prompt_start, NULL);
 
+#ifdef DEBUG_TOKENIZER
   printf("\nRunning inference...\n");
-
-  // No separate prompt processing needed - we process full context in each step
-
-  gettimeofday(&prompt_end, NULL);
-  gettimeofday(&gen_start, NULL);
+#else
+  // Print the original prompt for streaming output
+  if (use_tokenizer) {
+    printf("\n%s", prompt);
+    fflush(stdout);  // Ensure prompt is displayed immediately
+  } else {
+    printf("\nRunning inference...\n");
+  }
+#endif
+  PROF_START("inference");
 
   // Process initial prompt for KV cache
   if (use_kv_cache && prompt_len > 1) {
+#ifdef DEBUG_TOKENIZER
     printf("DEBUG: Processing prompt for KV cache (%d tokens)\n", prompt_len);
+#endif
     model_forward(qwen_states.logits, input_tokens, &weights, &config,
         &qwen_states, prompt_len, 0, use_kv_cache);
     qwen_states.cache_pos = prompt_len;
   }
 
+  gettimeofday(&prompt_end, NULL);
+  gettimeofday(&gen_start, NULL);
   // Generate new tokens
   int generation_start = use_tokenizer ? prompt_len - 1 : 0;
+
+  // Reset profiling counters for token generation only
 
   for (int step = 0; step < steps; step++) {
     gettimeofday(&step_start, NULL);
@@ -1425,7 +1569,9 @@ int main(int argc, char** argv) {
     if (use_kv_cache) {
       // KV cache mode: process only current token (autoregressive)
       int* current_token = &input_tokens[current_pos];
+#ifdef DEBUG_TOKENIZER
       printf("DEBUG: Processing token (KV cache, pos=%d): [%d]\n", current_pos, *current_token);
+#endif
 
       model_forward(qwen_states.logits, current_token, &weights, &config,
           &qwen_states, 1, current_pos, use_kv_cache);
@@ -1433,17 +1579,20 @@ int main(int argc, char** argv) {
     } else {
       // Non-KV cache mode: process full sequence like test_model_trace.c
       int sequence_length = current_pos + 1;
+#ifdef DEBUG_TOKENIZER
       printf("DEBUG: Processing sequence (T=%d): [", sequence_length);
       for (int i = 0; i < sequence_length; i++) {
         printf("%d", input_tokens[i]);
         if (i < sequence_length - 1) printf(", ");
       }
       printf("]\n");
+#endif
 
       model_forward(qwen_states.logits, input_tokens, &weights, &config,
           &qwen_states, sequence_length, 0, use_kv_cache);
     }
 
+#ifdef DEBUG_TOKENIZER
     // Debug: show logits for specific tokens in step 1 (should generate 220)
     if (step == 1) {
       printf("DEBUG: Step %d logits[220]=%.6f logits[330]=%.6f logits[279]=%.6f\n",
@@ -1460,6 +1609,7 @@ int main(int argc, char** argv) {
       }
       printf("DEBUG: Actual argmax is token %d with logits=%.6f\n", max_idx, max_val);
     }
+#endif
 
     // Select next token (sampling or argmax)
     int predicted_token;
@@ -1485,26 +1635,48 @@ int main(int argc, char** argv) {
     if (use_tokenizer) {
       TokenizerResult decode_result;
       if (tokenizer_decode(tokenizer, &predicted_token, 1, &decode_result) == 0) {
+#ifdef DEBUG_TOKENIZER
+        // Debug mode: show step-by-step token information
         if (show_timing) {
           printf("Step %d: token=%d -> \"%s\" (%.2f ms)\n", step, predicted_token,
                  decode_result.token_strings[0], step_time);
         } else {
           printf("Step %d: token=%d -> \"%s\"\n", step, predicted_token, decode_result.token_strings[0]);
         }
+#else
+        // Streaming mode: just print the token text without step info
+        printf("%s", decode_result.token_strings[0]);
+        fflush(stdout);  // Ensure immediate output
+#endif
         tokenizer_result_free(&decode_result);
       } else {
+#ifdef DEBUG_TOKENIZER
         if (show_timing) {
           printf("Step %d: token=%d (decode failed, %.2f ms)\n", step, predicted_token, step_time);
         } else {
           printf("Step %d: token=%d (decode failed)\n", step, predicted_token);
         }
+#else
+        // In streaming mode, skip failed decodes silently or show minimal error
+        printf("[?]");
+        fflush(stdout);
+#endif
       }
     } else {
+#ifdef DEBUG_TOKENIZER
       if (show_timing) {
         printf("Step %d: predicted_token=%d (%.2f ms)\n", step, predicted_token, step_time);
       } else {
         printf("Step %d: predicted_token=%d\n", step, predicted_token);
       }
+#else
+      // Non-tokenizer mode: always show debug-style output
+      if (show_timing) {
+        printf("Step %d: predicted_token=%d (%.2f ms)\n", step, predicted_token, step_time);
+      } else {
+        printf("Step %d: predicted_token=%d\n", step, predicted_token);
+      }
+#endif
     }
 
     // Compare with reference if available
@@ -1534,8 +1706,17 @@ int main(int argc, char** argv) {
           expected_token, logit_error, prob_error);
     }
 
+#ifdef DEBUG_TOKENIZER
+    printf("\n");
+#endif
+  }
+
+#ifndef DEBUG_TOKENIZER
+  // Add newline after streaming output
+  if (use_tokenizer) {
     printf("\n");
   }
+#endif
 
   gettimeofday(&gen_end, NULL);
   gettimeofday(&end_time, NULL);
@@ -1548,6 +1729,7 @@ int main(int argc, char** argv) {
     (gen_end.tv_usec - gen_start.tv_usec) / 1000000.0;
 
   if (show_timing) {
+    PROF_END("inference");
     printf("\n=== PERFORMANCE STATISTICS ===\n");
     if (use_tokenizer && prompt_len > 1) {
       double prompt_tokens = prompt_len - 1;
@@ -1562,7 +1744,13 @@ int main(int argc, char** argv) {
            total_time, total_time * 1000.0 / steps);
   }
 
-  // Generate final output for tokenizer mode
+  // Print detailed profiling summary for token generation (only when enabled)
+#ifdef ENABLE_DETAILED_PROFILING
+  profile_print_summary_table();
+#endif
+
+#ifdef DEBUG_TOKENIZER
+  // Generate final output for tokenizer mode - only in debug mode
   if (use_tokenizer) {
     int output_len = prompt_len + steps;
     TokenizerResult final_decode;
@@ -1579,6 +1767,7 @@ int main(int argc, char** argv) {
       tokenizer_result_free(&final_decode);
     }
   }
+#endif
 
   // Cleanup
   if (tokenizer) {
@@ -1592,7 +1781,13 @@ int main(int argc, char** argv) {
   if (ref_probs) npy_free(ref_probs);
 
   free_qwen_states(&qwen_states);
+#ifdef USE_MMAP
   bin_free_mmap(bin_file);
+#else
+  bin_free(bin_file);
+#endif
+  PROF_END("main");
+  PROF_PRINT();
 
   return 0;
 }

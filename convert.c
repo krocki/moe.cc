@@ -27,6 +27,7 @@
 #include <errno.h>
 #include "io.h"
 #include "quant.h"
+#include "convert.h"
 
 /**
  * Program configuration structure
@@ -36,6 +37,7 @@ typedef struct {
   char* output_path;     // Output .bin file path  
   QuantType quant_type;  // Quantization type (Q8, Q4, or NONE)
   size_t group_size;     // Group size for quantization (required > 0)
+  char* quantize_selection; // Which weights to quantize: "all", "attn", "moe", "lm_head", "attn,moe", etc.
   bool verbose;          // Enable verbose output
   bool help;             // Show help and exit
   bool version;          // Show version and exit
@@ -47,26 +49,33 @@ typedef struct {
 static void print_usage(const char* program_name) {
   printf("Tensor Quantization Conversion Tool v%s\n", CONVERT_VERSION);
   printf("Converts FP32 tensors to quantized formats (Q8/Q4) in C\n\n");
-  printf("Usage: %s --input INPUT.bin --quant QUANT_TYPE --group-size N --output OUTPUT.bin\n\n", program_name);
+  printf("Usage: %s --input INPUT.bin --quant QUANT_TYPE --group-size N --output OUTPUT.bin [--quantize SELECTION]\n\n", program_name);
   printf("Required Arguments:\n");
   printf("  --input PATH      Input .bin file (FP32 tensors)\n");
   printf("  --quant TYPE      Quantization type: q8, q4, or none\n");
   printf("  --group-size N    Group size for quantization (must be power of 2: 1, 2, 4, 8, 16, 32, 64, 128, etc.)\n");
   printf("  --output PATH     Output .bin file (quantized tensors)\n\n");
   printf("Optional Arguments:\n");
-  printf("  --verbose       Enable verbose output\n");
-  printf("  --version       Show version information\n");
-  printf("  --help          Show this help message\n\n");
+  printf("  --quantize SEL    Which weights to quantize (default: moe)\n");
+  printf("                    Options: all, attn, moe, lm_head, or combinations like \"attn,moe\"\n");
+  printf("                    - all: everything (attention + experts + lm_head)\n");
+  printf("                    - attn: attention weights (Wq, Wk, Wv, Wo)\n");
+  printf("                    - moe: expert weights (gate_proj, up_proj, down_proj)\n");
+  printf("                    - lm_head: output head weights\n");
+  printf("  --verbose         Enable verbose output\n");
+  printf("  --full-progress   Enable detailed progress output (show each tensor)\n");
+  printf("  --version         Show version information\n");
+  printf("  --help            Show this help message\n\n");
   printf("Examples:\n");
-  printf("  # Convert complete model to Q8 with group size 128\n");
-  printf("  %s --input all.bin --quant q8 --group-size 128 --output all_q8.bin\n\n", program_name);
-  printf("  # Convert complete model to Q4 with group size 64\n");
-  printf("  %s --input all.bin --quant q4 --group-size 64 --output all_q4.bin\n\n", program_name);
-  printf("  # Convert single tensor with group size 32\n");
-  printf("  %s --input layer.weight.bin --quant q8 --group-size 32 --output layer.weight_q8.bin\n\n", program_name);
+  printf("  # Convert all weights to Q8 with group size 128\n");
+  printf("  %s --input all.bin --quant q8 --group-size 128 --quantize all --output all_q8.bin\n\n", program_name);
+  printf("  # Convert only attention weights to Q4 with group size 64\n");
+  printf("  %s --input all.bin --quant q4 --group-size 64 --quantize attn --output all_q4_attn.bin\n\n", program_name);
+  printf("  # Convert experts and lm_head to Q8\n");
+  printf("  %s --input all.bin --quant q8 --group-size 128 --quantize \"moe,lm_head\" --output all_q8_moe.bin\n\n", program_name);
   printf("Notes:\n");
-  printf("  - Only expert weight matrices are quantized (gate_proj, up_proj, down_proj)\n");
-  printf("  - Other tensors (attention, norms, embeddings) remain FP32\n");
+  printf("  - Default quantizes only expert weights (--quantize moe)\n");
+  printf("  - Embeddings always remain FP32 for accuracy\n");
   printf("  - Output format matches export.py conventions\n");
   printf("  - Quantized tensors create .scale + .q8/.q4 pairs\n");
 }
@@ -79,6 +88,7 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
   memset(config, 0, sizeof(ConvertConfig));
   config->quant_type = QUANT_NONE;
   config->group_size = 0; // Will be required to be > 0
+  config->quantize_selection = strdup("moe"); // Default: only expert weights
   
   // Define long options
   static struct option long_options[] = {
@@ -86,7 +96,9 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
     {"output",     required_argument, 0, 'o'},
     {"quant",      required_argument, 0, 'q'},
     {"group-size", required_argument, 0, 'g'},
+    {"quantize",   required_argument, 0, 'Q'},  // New option
     {"verbose",    no_argument,       0, 'v'},
+    {"full-progress", no_argument,    0, 'f'},
     {"version",    no_argument,       0, 'V'},
     {"help",       no_argument,       0, 'h'},
     {0, 0, 0, 0}
@@ -95,7 +107,7 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
   int option_index = 0;
   int c;
   
-  while ((c = getopt_long(argc, argv, "i:o:q:g:vVh", long_options, &option_index)) != -1) {
+  while ((c = getopt_long(argc, argv, "i:o:q:g:Q:vfVh", long_options, &option_index)) != -1) {
     switch (c) {
       case 'i':
         config->input_path = strdup(optarg);
@@ -131,8 +143,15 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
           config->group_size = (size_t)group_size;
         }
         break;
+      case 'Q':
+        free(config->quantize_selection); // Free default "moe"
+        config->quantize_selection = strdup(optarg);
+        break;
       case 'v':
         config->verbose = true;
+        break;
+      case 'f':
+        set_full_progress(1);
         break;
       case 'V':
         config->version = true;
@@ -178,6 +197,7 @@ static int parse_arguments(int argc, char* argv[], ConvertConfig* config) {
 static void free_config(ConvertConfig* config) {
   free(config->input_path);
   free(config->output_path);
+  free(config->quantize_selection);
 }
 
 /**
@@ -188,19 +208,51 @@ static bool file_exists(const char* path) {
   return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
 }
 
+/**
+ * Check if a tensor should be quantized based on selection
+ */
+static bool should_quantize_with_selection(const char* tensor_name, const char* quantize_selection) {
+  if (!tensor_name || !quantize_selection) return false;
+  
+  // Check for "all" - quantize everything
+  if (strstr(quantize_selection, "all") != NULL) {
+    return should_quantize_tensor(tensor_name);
+  }
+  
+  // Check specific selections
+  bool quantize_attn = (strstr(quantize_selection, "attn") != NULL);
+  bool quantize_moe = (strstr(quantize_selection, "moe") != NULL);  
+  bool quantize_lm_head = (strstr(quantize_selection, "lm_head") != NULL);
+  
+  // Check if this tensor matches any selected categories
+  if (quantize_attn && is_attention_tensor(tensor_name)) {
+    return true;
+  }
+  if (quantize_moe && (strstr(tensor_name, "gate_proj") != NULL ||
+                       strstr(tensor_name, "up_proj") != NULL ||
+                       strstr(tensor_name, "down_proj") != NULL)) {
+    return true;
+  }
+  if (quantize_lm_head && is_lm_head_tensor(tensor_name)) {
+    return true;
+  }
+  
+  return false;
+}
+
 
 /**
  * Convert a single tensor by applying quantization if appropriate (streaming version)
  * Writes output tensors directly to stream writer instead of accumulating in memory
  * Returns the number of tensors written to output (1 for unquantized, 2 for quantized)
  */
-static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStreamWriter* writer, 
-                                          QuantType quant_type, size_t group_size, bool verbose) {
+static int convert_single_tensor_streaming(const Tensor* input_tensor, BinStreamWriter* writer, 
+                                          QuantType quant_type, size_t group_size, const char* quantize_selection, bool verbose) {
   if (!input_tensor || !writer) return 0;
   
   const char* tensor_name = input_tensor->name;
   bool should_quantize = (quant_type != QUANT_NONE) && 
-                        should_quantize_tensor(tensor_name) && 
+                        should_quantize_with_selection(tensor_name, quantize_selection) && 
                         (input_tensor->ndim == 2) && 
                         (input_tensor->dtype == 0); // Only quantize f32 2D tensors
   
@@ -227,7 +279,16 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
   }
   
   // Quantize the tensor
-  QuantizedTensor* qt = quantize_tensor(input_tensor, quant_type, group_size);
+  // Force lm_head to Q8 quantization regardless of command line option
+  QuantType actual_quant_type = quant_type;
+  if (is_lm_head_tensor(tensor_name)) {
+    actual_quant_type = QUANT_Q8;
+    if (verbose && quant_type != QUANT_Q8) {
+      printf("  Note: Forcing lm_head to Q8 quantization for better accuracy\n");
+    }
+  }
+  
+  QuantizedTensor* qt = quantize_tensor(input_tensor, actual_quant_type, group_size);
   if (!qt) {
     fprintf(stderr, "Error: Failed to quantize tensor %s\n", tensor_name);
     return 0;
@@ -239,7 +300,7 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
   
   // Create scale tensor (1D array of per-row or per-group scales)
   int scale_shape[1] = { (int)qt->num_groups };
-  TensorBin* scale_tensor = tensor_create_with_group_size(scale_name, 0, 1, scale_shape, qt->scales, group_size);
+  Tensor* scale_tensor = tensor_create_with_group_size(scale_name, 0, 1, scale_shape, qt->scales, group_size);
   if (!scale_tensor) {
     fprintf(stderr, "Error: Failed to create scale tensor for %s\n", tensor_name);
     quantized_tensor_free(qt);
@@ -251,7 +312,7 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
   int quant_dtype;
   int quant_shape[2];
   
-  if (quant_type == QUANT_Q8) {
+  if (actual_quant_type == QUANT_Q8) {
     snprintf(quant_name, sizeof(quant_name), "%s.q8", tensor_name);
     quant_dtype = 2; // i8
     quant_shape[0] = input_tensor->shape[0]; // rows
@@ -264,7 +325,7 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
   }
   
   // Create quantized tensor
-  TensorBin* quant_tensor = tensor_create_with_group_size(quant_name, quant_dtype, 2, quant_shape, qt->q_data, group_size);
+  Tensor* quant_tensor = tensor_create_with_group_size(quant_name, quant_dtype, 2, quant_shape, qt->q_data, group_size);
   if (!quant_tensor) {
     fprintf(stderr, "Error: Failed to create quantized tensor for %s\n", tensor_name);
     tensor_free_single(scale_tensor);
@@ -273,12 +334,12 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
   }
   
   // For Q4, also save zero points tensor
-  TensorBin* zero_point_tensor = NULL;
-  if (quant_type == QUANT_Q4 && qt->zero_points) {
+  Tensor* zero_point_tensor = NULL;
+  if (actual_quant_type == QUANT_Q4 && qt->zero_points) {
     char zp_name[512];
     snprintf(zp_name, sizeof(zp_name), "%s.zero_point", tensor_name);
     int zp_shape[1] = {qt->num_groups};
-    zero_point_tensor = tensor_create_with_group_size(zp_name, 2, 1, zp_shape, qt->zero_points, group_size);
+    zero_point_tensor = tensor_create_with_group_size(zp_name, 0, 1, zp_shape, qt->zero_points, group_size);
     if (!zero_point_tensor) {
       fprintf(stderr, "Error: Failed to create zero_point tensor for %s\n", tensor_name);
       tensor_free_single(scale_tensor);
@@ -300,7 +361,7 @@ static int convert_single_tensor_streaming(const TensorBin* input_tensor, BinStr
   if (zero_point_tensor) tensor_free_single(zero_point_tensor);
   quantized_tensor_free(qt);
   
-  int expected_tensors = (quant_type == QUANT_Q4) ? 3 : 2;  // Q4 saves 3 tensors, Q8 saves 2
+  int expected_tensors = (actual_quant_type == QUANT_Q4) ? 3 : 2;  // Q4 saves 3 tensors, Q8 saves 2
   if (written_count != expected_tensors) {
     fprintf(stderr, "Error: Failed to write quantized tensors for %s (expected %d, wrote %d)\n", 
             tensor_name, expected_tensors, written_count);
@@ -370,7 +431,7 @@ static int convert_tensors(const ConvertConfig* config) {
   }
   
   // Process tensors one by one in streaming fashion
-  TensorBin tensor;
+  Tensor tensor;
   int total_output_tensors = 0;
   int quantized_tensors = 0;
   int result;
@@ -382,7 +443,7 @@ static int convert_tensors(const ConvertConfig* config) {
   
   while ((result = bin_stream_reader_next_tensor(reader, &tensor)) == 1) {
     // Convert and write tensor using streaming approach
-    int written = convert_single_tensor_streaming(&tensor, writer, config->quant_type, config->group_size, config->verbose);
+    int written = convert_single_tensor_streaming(&tensor, writer, config->quant_type, config->group_size, config->quantize_selection, config->verbose);
     
     if (written == 0) {
       fprintf(stderr, "Error: Failed to convert tensor %s\n", tensor.name);
@@ -483,4 +544,85 @@ int main(int argc, char* argv[]) {
   // Cleanup and exit
   free_config(&config);
   return result;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS FOR CONVERSION TOOL (moved from quant.c)
+// ============================================================================
+
+/**
+ * Check if a tensor should be quantized based on its name
+ */
+bool should_quantize_tensor(const char* tensor_name) {
+    // Don't quantize embedding layers - they need high precision for initial lookup
+    if (strstr(tensor_name, "tok_embeddings") != NULL) return false;
+    if (strstr(tensor_name, "embed_tokens") != NULL) return false;
+    if (strstr(tensor_name, "embeddings") != NULL) return false;
+    
+    // QUANTIZE lm_head to Q8 for final logit computation (always Q8, never Q4)
+    if (strstr(tensor_name, "lm_head") != NULL) return true;
+    if (strstr(tensor_name, "output") != NULL && strstr(tensor_name, "weight") != NULL) return true;
+    
+    // QUANTIZE attention weights (Wq, Wk, Wv, Wo) to Q8 for better efficiency
+    if (strstr(tensor_name, "q_proj.weight") != NULL) return true;
+    if (strstr(tensor_name, "k_proj.weight") != NULL) return true;
+    if (strstr(tensor_name, "v_proj.weight") != NULL) return true;
+    if (strstr(tensor_name, "o_proj.weight") != NULL) return true;
+    
+    // Don't quantize normalization layers
+    if (strstr(tensor_name, "norm") != NULL) return false;
+    if (strstr(tensor_name, "ln") != NULL) return false;
+    
+    // Don't quantize router/gate layers - they need high precision for expert routing
+    if (strstr(tensor_name, "router") != NULL) return false;
+    if (strstr(tensor_name, "gate.weight") != NULL && strstr(tensor_name, "experts") == NULL) return false;
+    
+    // Only quantize expert MLP layers - keep router and attention layers in FP32
+    if (strstr(tensor_name, "experts") != NULL) return true;
+    if (strstr(tensor_name, "dense") != NULL) return true;
+    if (strstr(tensor_name, "linear") != NULL) return true;
+    
+    // Default: don't quantize unknown layers
+    return false;
+}
+
+/**
+ * Check if lm_head should be quantized to Q8 (always Q8, never Q4)
+ */
+bool is_lm_head_tensor(const char* tensor_name) {
+    return (strstr(tensor_name, "lm_head") != NULL) || 
+           (strstr(tensor_name, "output") != NULL && strstr(tensor_name, "weight") != NULL);
+}
+
+/**
+ * Check if attention weights should be quantized to Q8
+ */
+bool is_attention_tensor(const char* tensor_name) {
+    return (strstr(tensor_name, "q_proj.weight") != NULL) ||
+           (strstr(tensor_name, "k_proj.weight") != NULL) ||
+           (strstr(tensor_name, "v_proj.weight") != NULL) ||
+           (strstr(tensor_name, "o_proj.weight") != NULL);
+}
+
+/**
+ * Calculate size needed for quantized data storage
+ */
+size_t get_quantized_data_size(size_t rows, size_t cols, QuantType qtype) {
+    switch (qtype) {
+        case QUANT_Q8:
+            return rows * cols * sizeof(int8_t);
+        case QUANT_Q4:
+            return (rows * cols + 1) / 2;  // Packed 4-bit
+        default:
+            return rows * cols * sizeof(float);  // FP32
+    }
+}
+
+/**
+ * Calculate size needed for scaling factors
+ */
+size_t get_scales_size(size_t rows, size_t cols, size_t group_size) {
+    size_t total_elements = rows * cols;
+    size_t num_groups = (total_elements + group_size - 1) / group_size;  // Ceiling division
+    return num_groups * sizeof(float);
 }
