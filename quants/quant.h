@@ -77,4 +77,20 @@ void matmul_f32_q4_f32_with_zeros(const float* A_f32, const uint8_t* B4,
                                   float* C, int M, int N, int K, int gs,
                                   int8_t* A_q_scratch, float* A_s_scratch);
 
+// ================================================================
+// LOW-LEVEL KERNELS (exposed for templated implementations)
+// ================================================================
+
+/**
+ * S8×Q4 dot product with accumulation
+ * Used internally by matrix multiplication functions
+ */
+void dot_s8q4_acc(const int8_t* a, const uint8_t* b4, int n, int32_t* dot, int32_t* sum_a);
+
+/**
+ * S8×S8 dot product
+ * Used internally by matrix multiplication functions
+ */
+int32_t dot_s8s8(const int8_t* a, const int8_t* b, int n);
+
 #endif // QUANT_H
