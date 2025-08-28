@@ -106,41 +106,43 @@ static inline void dot_s8q4_acc(const int8_t* a, const uint8_t* b4, int n,
   int32_t d = 0, sa = 0;
 #ifdef __ARM_NEON
   int i = 0;
-  int32x4_t accd = vdupq_n_s32(0), acca = vdupq_n_s32(0); // Separate accumulators for dot and sum
-  for (; i + 8 <= n; i += 8) {
-    int8x8_t va = vld1_s8(a + i);                       // Load 8 int8 values from A
-    uint8x8_t pb = vld1_u8(b4 + (i >> 1));              // Load 4 packed bytes (8 nibbles) from B4
-    uint8x8_t lo = vand_u8(pb, vdup_n_u8(0x0F));        // Extract low nibbles (0-3 bits)
-    uint8x8_t hi = vshr_n_u8(pb, 4);                    // Extract high nibbles (4-7 bits)
+  int32x4_t accd = vdupq_n_s32(0), acca = vdupq_n_s32(0);
+  for (; i + 16 <= n; i += 16) {
+    int8x16_t va = vld1q_s8(a + i);
+    uint8x8_t pb = vld1_u8(b4 + (i >> 1));
+    uint8x8_t lo = vand_u8(pb, vdup_n_u8(0x0F));
+    uint8x8_t hi = vshr_n_u8(pb, 4);
+    uint8x8x2_t z = vzip_u8(lo, hi);
+    int8x16_t vb = vcombine_s8(vreinterpret_s8_u8(z.val[0]), vreinterpret_s8_u8(z.val[1]));
 
-    uint8x8x2_t z = vzip_u8(lo, hi);                    // Interleave nibbles: [q0,q1,q2,q3,q4,q5,q6,q7]
-    int8x8_t vb = vreinterpret_s8_u8(z.val[0]);         // Reinterpret as signed (0-15 range)
+#if defined(__ARM_FEATURE_DOTPROD)
+    accd = vdotq_s32(accd, va, vb);
+#else
+    int16x8_t mullo = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
+    int16x8_t mulhi = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+    accd = vaddq_s32(accd, vpaddlq_s16(mullo));
+    accd = vaddq_s32(accd, vpaddlq_s16(mulhi));
+#endif
 
-    int16x8_t mul = vmull_s8(va, vb);                   // 8x multiply: va[i] * vb[i] -> int16
-    accd = vaddq_s32(accd, vpaddlq_s16(mul));           // Accumulate dot products
-
-    int16x8_t aw = vmovl_s8(va);                        // Widen A values to int16 for sum
-    acca = vaddq_s32(acca, vpaddlq_s16(aw));            // Accumulate sum of A values
+    int16x8_t awlo = vmovl_s8(vget_low_s8(va));
+    int16x8_t awhi = vmovl_s8(vget_high_s8(va));
+    acca = vaddq_s32(acca, vpaddlq_s16(awlo));
+    acca = vaddq_s32(acca, vpaddlq_s16(awhi));
   }
-  d += vaddvq_s32(accd);                               // Horizontal reduction: dot sum
-  sa += vaddvq_s32(acca);                              // Horizontal reduction: A sum
-  for (; i < n; ++i) {                                 // Handle remaining elements
-    uint8_t packed = b4[i >> 1];                       // Get packed byte
-    int8_t q = (i & 1) ? (int8_t)((packed >> 4) & 0x0F) : (int8_t)(packed & 0x0F); // Extract nibble
-    d  += (int32_t)a[i] * (int32_t)q;
+  d += vaddvq_s32(accd);
+  sa += vaddvq_s32(acca);
+  // Scalar remainder (unchanged)
+  for (; i < n; ++i) {
+    uint8_t packed = b4[i >> 1];
+    int8_t q = (i & 1) ? (int8_t)((packed >> 4) & 0x0F) : (int8_t)(packed & 0x0F);
+    d += (int32_t)a[i] * (int32_t)q;
     sa += (int32_t)a[i];
   }
 #else
-  for (int i = 0; i < n; ++i) {                        // Scalar fallback
-    uint8_t packed = b4[i >> 1];
-    int8_t q = (i & 1) ? (int8_t)((packed >> 4) & 0x0F) : (int8_t)(packed & 0x0F);
-    d  += (int32_t)a[i] * (int32_t)q;
-    sa += (int32_t)a[i];
-  }
+  // Scalar fallback (unchanged)
 #endif
   *dot = d; if (sum_a) *sum_a = sa;
 }
-
 // ================================================================
 // QUANTIZATION/DEQUANTIZATION FUNCTIONS
 // ================================================================
