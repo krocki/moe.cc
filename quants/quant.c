@@ -375,7 +375,9 @@ void matmul_f32_q4_f32(const float* A_fp32, const uint8_t* B_q4, const float* B_
       matmul_f32_q4_f32_with_zeros(A_fp32, B_q4, B_scales, neutral_zeros_large, C, M, N, K, group_size, qx_q_scratch, qx_s_scratch);
       free(neutral_zeros_large);
     } else {
-      matmul_q8_q8_f32(qx_q_scratch, qx_s_scratch, (const int8_t*)B_q4, B_scales, C, M, N, K, group_size);
+      // Fallback: allocation failed - this should be very rare for reasonable model sizes
+      fprintf(stderr, "Error: Failed to allocate %d neutral zeros for Q4 matmul\n", num_groups);
+      exit(1);  // Better to fail explicitly than produce wrong results
     }
   }
 }
@@ -422,3 +424,4 @@ void matmul_f32_q4_f32_with_zeros(const float* A_f32, const uint8_t* B4,
     }
   }
 }
+
